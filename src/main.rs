@@ -205,6 +205,9 @@ fn cmd_play(password: &str, move_tokens: &[String]) -> Result<(), String> {
     for mv in &moves {
         let before = session.project();
         if before.winner.is_some() {
+            // Only reachable mid-chain — an already-won game returns above. The
+            // win is still announced below; this reports the moves it swallowed.
+            failure = Some("the game is over".into());
             break;
         }
         if &before.current_player().player_id != you {
@@ -224,7 +227,7 @@ fn cmd_play(password: &str, move_tokens: &[String]) -> Result<(), String> {
         for p in &payloads {
             session.append(Some(you.clone()), p.clone());
         }
-        report(&before, &payloads, &session.project(), you);
+        report(&before, &payloads, &session.project());
     }
 
     if session.log.len() > entries_before {
@@ -248,20 +251,21 @@ fn cmd_play(password: &str, move_tokens: &[String]) -> Result<(), String> {
 
 /// Narrate one applied move. `before` names the actor (banking and busting both
 /// hand the turn on, so `after` would credit the wrong player).
-fn report(before: &GameState, payloads: &[Payload], after: &GameState, you: &str) {
-    let actor = &before.current_player().name;
+fn report(before: &GameState, payloads: &[Payload], after: &GameState) {
+    let actor = before.current_player();
     for p in payloads {
         match p {
-            Payload::Rolled { dice } => println!("{actor} rolled: {}", fmt_dice(dice)),
+            Payload::Rolled { dice } => println!("{} rolled: {}", actor.name, fmt_dice(dice)),
             Payload::Kept { points, .. } => {
                 println!("Kept for {points} — turn total now {}.", after.turn_total)
             }
             Payload::Busted { .. } => {
-                println!("BUST! No scoring dice. {actor} loses this turn.")
+                println!("BUST! No scoring dice. {} loses this turn.", actor.name)
             }
-            Payload::Banked { points } => {
-                println!("{actor} banked {points} — total {}.", after.totals[you])
-            }
+            Payload::Banked { points } => println!(
+                "{} banked {points} — total {}.",
+                actor.name, after.totals[&actor.player_id]
+            ),
             _ => {}
         }
     }
