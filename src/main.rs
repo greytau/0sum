@@ -17,7 +17,7 @@ use clap::{Parser, Subcommand};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 
-use game::{Farkle, Game, Move};
+use game::{Farkle, Game};
 use ruleset::RuleSet;
 use session::{GameState, Payload, Phase, RosterEntry, Session};
 use storage::IndexEntry;
@@ -45,7 +45,8 @@ enum Command {
     },
     /// Claim a seat by name in a session, print that player's password.
     Register { session_id: String, name: String },
-    /// Make a move: `roll`, `keep <dice...>`, or `bank`.
+    /// Make a move: `roll`, `keep <dice...>`, or `bank`. Moves chain:
+    /// `keep 5 5 roll`.
     Play {
         password: String,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -151,11 +152,16 @@ fn cmd_register(session_id: &str, name: &str) -> Result<(), String> {
     println!("  PASSWORD (keep secret):  {password}");
     println!();
     if state.started {
-        println!(
-            "All players in. {} plays first:",
-            state.current_player().name
-        );
-        println!("  0sum play {password} roll");
+        let first = state.current_player();
+        if first.player_id == seat.player_id {
+            println!("All players in. You play first:");
+            println!("  0sum play {password} roll");
+        } else {
+            // Never caption someone else's turn with this password — it would
+            // print a command that leaks the secret and cannot work.
+            println!("All players in. {} plays first:", first.name);
+            println!("  0sum play <{}'s password> roll", first.name);
+        }
     } else {
         let waiting: Vec<&str> = state
             .roster
@@ -188,64 +194,77 @@ fn cmd_play(password: &str, move_tokens: &[String]) -> Result<(), String> {
     }
 
     let you = &entry.player_id;
-    if &state.current_player().player_id != you {
-        return Err(format!(
-            "it's {}'s turn, not yours",
-            state.current_player().name
-        ));
+    let moves = farkle.parse_moves(move_tokens)?;
+    let mut rng = StdRng::from_entropy();
+    let entries_before = session.log.len();
+
+    // Chained moves are applied one at a time against freshly projected state,
+    // so a move that ends the turn (bust, bank, win) stops the rest of the chain
+    // instead of playing on someone else's turn.
+    let mut failure = None;
+    for mv in &moves {
+        let before = session.project();
+        if before.winner.is_some() {
+            break;
+        }
+        if &before.current_player().player_id != you {
+            failure = Some(format!(
+                "it's {}'s turn, not yours",
+                before.current_player().name
+            ));
+            break;
+        }
+        let payloads = match farkle.apply(&before, mv, &mut rng) {
+            Ok(payloads) => payloads,
+            Err(e) => {
+                failure = Some(e);
+                break;
+            }
+        };
+        for p in &payloads {
+            session.append(Some(you.clone()), p.clone());
+        }
+        report(&before, &payloads, &session.project(), you);
     }
 
-    let mv = farkle.parse_move(move_tokens)?;
-    let mut rng = StdRng::from_entropy();
-    let payloads = farkle.apply(&state, &mv, &mut rng)?;
+    if session.log.len() > entries_before {
+        storage::save_session(&session)?;
+        let after = session.project();
+        println!();
+        render(&after);
+        println!();
+        if let Some(winner) = &after.winner {
+            println!(">>> {} WINS! <<<", after.name_of(winner));
+        } else {
+            println!("{}", next_hint(&after));
+        }
+    }
 
-    let mut busted = false;
-    let mut banked: Option<u32> = None;
-    for p in &payloads {
+    match failure {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+/// Narrate one applied move. `before` names the actor (banking and busting both
+/// hand the turn on, so `after` would credit the wrong player).
+fn report(before: &GameState, payloads: &[Payload], after: &GameState, you: &str) {
+    let actor = &before.current_player().name;
+    for p in payloads {
         match p {
-            Payload::Busted { .. } => busted = true,
-            Payload::Banked { points } => banked = Some(*points),
+            Payload::Rolled { dice } => println!("{actor} rolled: {}", fmt_dice(dice)),
+            Payload::Kept { points, .. } => {
+                println!("Kept for {points} — turn total now {}.", after.turn_total)
+            }
+            Payload::Busted { .. } => {
+                println!("BUST! No scoring dice. {actor} loses this turn.")
+            }
+            Payload::Banked { points } => {
+                println!("{actor} banked {points} — total {}.", after.totals[you])
+            }
             _ => {}
         }
-        session.append(Some(you.clone()), p.clone());
     }
-    storage::save_session(&session)?;
-
-    let after = session.project();
-
-    if let Some(Payload::Rolled { dice }) = payloads.first() {
-        println!("{} rolled: {}", state.current_player().name, fmt_dice(dice));
-    }
-    if let Move::Keep(_) = mv {
-        if let Some(Payload::Kept { points, .. }) = payloads.first() {
-            println!("Kept for {points} — turn total now {}.", after.turn_total);
-        }
-    }
-    if busted {
-        println!(
-            "BUST! No scoring dice. {} loses this turn.",
-            state.current_player().name
-        );
-    }
-    if let Some(points) = banked {
-        println!(
-            "{} banked {points} — total {}.",
-            state.current_player().name,
-            after.totals[you]
-        );
-    }
-
-    println!();
-    render(&after);
-
-    if let Some(winner) = &after.winner {
-        println!();
-        println!(">>> {} WINS! <<<", after.name_of(winner));
-    } else {
-        println!();
-        println!("{}", next_hint(&after));
-    }
-    Ok(())
 }
 
 fn render(state: &GameState) {
