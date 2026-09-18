@@ -17,15 +17,22 @@ The christening project of the [`greytau`](https://github.com/greytau) org.
 
 ## Status
 
-**Phase 1 — work in progress.** Hotseat Farkle: the engine, the `Game` trait, the
-signed hash-chained state log, and the CLI flow. Plain-text UI. Nothing playable
-yet — this is the genesis scaffold.
+**Phase 1 — hotseat Farkle is playable.** The engine, the `Game` trait, rulesets,
+and the CLI flow are in. Plain-text UI. The default ruleset is `kcd` (Kingdom Come:
+Deliverance scoring, first to 4000; the Devil's head wild die is not implemented).
+
+Phase 1 is *hotseat*: dice come from the local machine's OS entropy, so it is fair
+when both players share a terminal. Cross-machine play needs the commit-reveal dice
+described in the design — that is the next phase, not this one.
 
 The command builds to a binary named `0sum`:
 
 ```console
-$ 0sum
-0sum — provably-fair CLI games (WIP)
+$ 0sum new farkle                 # prompts for players, prints a SESSION ID
+$ 0sum register <SESSION> <name>  # claim your seat, prints your password (keep it secret)
+$ 0sum play <password> roll
+$ 0sum play <password> keep 1 5   # set aside scoring dice from the table
+$ 0sum play <password> bank       # end your turn and keep the points
 ```
 
 ## Design
