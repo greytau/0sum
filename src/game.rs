@@ -12,7 +12,7 @@ use crate::scoring::{has_any_score, score_selection};
 use crate::session::{GameState, Payload, Phase};
 
 /// A parsed player action.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Move {
     Roll,
     Keep(Vec<u8>),
@@ -22,8 +22,9 @@ pub enum Move {
 pub trait Game {
     fn id(&self) -> &'static str;
 
-    /// Parse the CLI move tokens into a [`Move`].
-    fn parse_move(&self, tokens: &[String]) -> Result<Move, String>;
+    /// Parse the CLI move tokens into the sequence of [`Move`]s they spell out.
+    /// Several moves may be chained in one invocation (`keep 5 5 roll`).
+    fn parse_moves(&self, tokens: &[String]) -> Result<Vec<Move>, String>;
 
     /// Apply a move against projected state, producing the events to append.
     /// Does not mutate — it returns payloads for the caller to append+persist.
@@ -33,37 +34,66 @@ pub trait Game {
 
 pub struct Farkle;
 
+enum Verb {
+    Roll,
+    Keep,
+    Bank,
+}
+
+/// A token is either a verb or a die face, never both — that boundary is what
+/// lets `keep` stop eating arguments when the next move starts.
+fn as_verb(token: &str) -> Option<Verb> {
+    match token.to_ascii_lowercase().as_str() {
+        "roll" | "r" => Some(Verb::Roll),
+        "keep" | "k" => Some(Verb::Keep),
+        "bank" | "b" => Some(Verb::Bank),
+        _ => None,
+    }
+}
+
 impl Game for Farkle {
     fn id(&self) -> &'static str {
         "farkle"
     }
 
-    fn parse_move(&self, tokens: &[String]) -> Result<Move, String> {
-        let (verb, rest) = tokens
-            .split_first()
-            .ok_or("no move given (try: roll | keep <dice...> | bank)")?;
-        match verb.to_ascii_lowercase().as_str() {
-            "roll" | "r" => Ok(Move::Roll),
-            "bank" | "b" => Ok(Move::Bank),
-            "keep" | "k" => {
-                if rest.is_empty() {
-                    return Err("keep needs dice, e.g. `keep 1 5`".into());
+    fn parse_moves(&self, tokens: &[String]) -> Result<Vec<Move>, String> {
+        let mut moves = Vec::new();
+        let mut rest = tokens;
+        while let Some((token, tail)) = rest.split_first() {
+            let verb = as_verb(token).ok_or_else(|| {
+                format!("unknown move `{token}` (try: roll | keep <dice...> | bank)")
+            })?;
+            rest = tail;
+            match verb {
+                Verb::Roll => moves.push(Move::Roll),
+                Verb::Bank => moves.push(Move::Bank),
+                Verb::Keep => {
+                    let end = rest
+                        .iter()
+                        .position(|t| as_verb(t).is_some())
+                        .unwrap_or(rest.len());
+                    let (faces, tail) = rest.split_at(end);
+                    rest = tail;
+                    if faces.is_empty() {
+                        return Err("keep needs dice, e.g. `keep 1 5`".into());
+                    }
+                    let dice = faces
+                        .iter()
+                        .map(|t| {
+                            t.parse::<u8>()
+                                .ok()
+                                .filter(|d| (1..=6).contains(d))
+                                .ok_or_else(|| format!("`{t}` is not a die face (1-6)"))
+                        })
+                        .collect::<Result<Vec<u8>, String>>()?;
+                    moves.push(Move::Keep(dice));
                 }
-                let dice = rest
-                    .iter()
-                    .map(|t| {
-                        t.parse::<u8>()
-                            .ok()
-                            .filter(|d| (1..=6).contains(d))
-                            .ok_or_else(|| format!("`{t}` is not a die face (1-6)"))
-                    })
-                    .collect::<Result<Vec<u8>, String>>()?;
-                Ok(Move::Keep(dice))
             }
-            other => Err(format!(
-                "unknown move `{other}` (try: roll | keep <dice...> | bank)"
-            )),
         }
+        if moves.is_empty() {
+            return Err("no move given (try: roll | keep <dice...> | bank)".into());
+        }
+        Ok(moves)
     }
 
     fn apply(
@@ -195,6 +225,59 @@ mod tests {
             },
         );
         s
+    }
+
+    fn parse(line: &str) -> Result<Vec<Move>, String> {
+        let tokens: Vec<String> = line.split_whitespace().map(String::from).collect();
+        Farkle.parse_moves(&tokens)
+    }
+
+    #[test]
+    fn keep_stops_eating_dice_at_the_next_verb() {
+        assert_eq!(
+            parse("keep 5 5 roll").unwrap(),
+            vec![Move::Keep(vec![5, 5]), Move::Roll]
+        );
+        assert_eq!(
+            parse("keep 1 bank").unwrap(),
+            vec![Move::Keep(vec![1]), Move::Bank]
+        );
+        assert_eq!(
+            parse("k 5 r").unwrap(),
+            vec![Move::Keep(vec![5]), Move::Roll]
+        );
+        assert_eq!(
+            parse("keep 1 keep 5").unwrap(),
+            vec![Move::Keep(vec![1]), Move::Keep(vec![5])]
+        );
+    }
+
+    #[test]
+    fn single_moves_still_parse_alone() {
+        assert_eq!(parse("roll").unwrap(), vec![Move::Roll]);
+        assert_eq!(parse("bank").unwrap(), vec![Move::Bank]);
+        assert_eq!(parse("keep 1 5 5").unwrap(), vec![Move::Keep(vec![1, 5, 5])]);
+    }
+
+    #[test]
+    fn rejects_junk_without_swallowing_it() {
+        assert!(parse("").is_err());
+        assert!(parse("keep").unwrap_err().contains("keep needs dice"));
+        assert!(parse("keep roll").unwrap_err().contains("keep needs dice"));
+        assert!(parse("keep 7").unwrap_err().contains("not a die face"));
+        assert!(parse("keep 5 wat").unwrap_err().contains("not a die face"));
+        assert!(parse("yeet").unwrap_err().contains("unknown move"));
+        assert!(parse("roll yeet").unwrap_err().contains("unknown move"));
+    }
+
+    /// The parser is a grammar, not a rules engine — legality is `apply`'s job.
+    #[test]
+    fn chains_are_parsed_even_when_illegal() {
+        assert_eq!(parse("roll roll").unwrap(), vec![Move::Roll, Move::Roll]);
+        assert_eq!(
+            parse("bank keep 1").unwrap(),
+            vec![Move::Bank, Move::Keep(vec![1])]
+        );
     }
 
     /// Greedy bot: keep the highest-scoring valid subset of the current table.
