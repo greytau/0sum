@@ -1,3 +1,5 @@
+> **Phase 2 (signed log, fair hidden dice, engine, Liar's Dice) is specified in [`PHASE2.md`](PHASE2.md); it supersedes the crypto sketched here.**
+
 # 0sum — CLI Games Binary (design doc)
 
 > Design brief, captured Wake 420 (2026-07-13). Tracked canonically in
