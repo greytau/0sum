@@ -4,6 +4,7 @@
 
 mod engine;
 mod farkle;
+mod liars_dice;
 mod storage;
 
 use std::io::{self, Write};
@@ -16,10 +17,11 @@ use rand::{RngCore, SeedableRng};
 use engine::keys::{self, Password, Secrets};
 use engine::log::Session;
 use engine::{
-    append_register, apply_chain, genesis_game, head_line, new_session, replay, replay_narrated,
-    Broken, Chain, Ctx, Game, Table,
+    append_register, apply_chain, escape, genesis_game, head_line, hw, new_session, replay,
+    replay_narrated, Broken, Chain, Ctx, Game, Table, MAX_SEATS,
 };
 use farkle::Farkle;
+use liars_dice::LiarsDice;
 use storage::{LoadError, Store};
 
 #[derive(Parser)]
@@ -37,9 +39,9 @@ struct Cli {
 enum Command {
     /// Create a new game session (prompts for players), print a session id.
     New {
-        /// Which game (currently: farkle).
+        /// Which game: farkle, liars-dice (aliases liarsdice, ld).
         game: String,
-        /// Ruleset variant (farkle: kcd [default], classic).
+        /// Ruleset variant (farkle: kcd [default], classic; liars-dice: classic [default], natural).
         #[arg(long)]
         ruleset: Option<String>,
     },
@@ -47,6 +49,7 @@ enum Command {
     Register { session_id: String, name: String },
     /// Play with the password in ZEROSUM_PASSWORD. No moves = show status.
     /// Farkle: `roll`, `keep <dice...>`, `bank`; moves chain: `keep 5 5 roll`.
+    /// Liar's Dice: `bid <qty> <face>`, `liar`, `spot` (one per call).
     Play {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         moves: Vec<String>,
@@ -56,7 +59,9 @@ enum Command {
 }
 
 const PASSWORD_ENV: &str = "ZEROSUM_PASSWORD";
-const LOAD_HINT: &str = "read -rs ZEROSUM_PASSWORD && export ZEROSUM_PASSWORD";
+/// A5: a shell variable passed per command, never exported, so the password
+/// doesn't ride along into every child process's environment.
+const LOAD_HINT: &str = r#"read -rs ZP; zs() { ZEROSUM_PASSWORD="$ZP" 0sum "$@"; }"#;
 
 fn main() {
     let cli = Cli::parse();
@@ -94,7 +99,11 @@ struct Engine<G>(PhantomData<G>);
 fn driver(game: &str) -> Result<&'static dyn Driver, String> {
     match game.to_ascii_lowercase().as_str() {
         "farkle" => Ok(&Engine::<Farkle>(PhantomData)),
-        other => Err(format!("unknown game `{other}` (available: farkle)")),
+        "liars-dice" | "liarsdice" | "ld" => Ok(&Engine::<LiarsDice>(PhantomData)),
+        other => Err(format!(
+            "unknown game `{}` (available: farkle, liars-dice)",
+            escape(other)
+        )),
     }
 }
 
@@ -125,7 +134,9 @@ fn cmd_play(store: &Store, tokens: &[String]) -> Result<(), String> {
     let raw = std::env::var(PASSWORD_ENV)
         .ok()
         .filter(|v| !v.trim().is_empty())
-        .ok_or_else(|| format!("set {PASSWORD_ENV} ({LOAD_HINT})"))?;
+        .ok_or_else(|| {
+            format!("set {PASSWORD_ENV} — in this terminal run `{LOAD_HINT}`, paste your password, then use `zs play …`")
+        })?;
     let pw = Password::parse(&raw)?;
     let _lock = store.lock(pw.sid())?;
     let s = load(store, pw.sid())?;
@@ -170,18 +181,46 @@ fn print_steps<G: Game>(chain: &Chain<G>, names: &[String]) {
     }
 }
 
-fn print_status<G: Game>(s: &Session, t: &Table<G>, me: usize, ctx: &Ctx) {
+fn print_status<G: Game>(t: &Table<G>, me: usize, ctx: &Ctx) {
     println!();
     println!("{}", G::render(&t.state, &t.names, Some(me), Some(ctx)));
+}
+
+/// A4: on every password-holding run, so a human notices a vanished move.
+fn print_whereabouts<G: Game>(s: &Session, t: &Table<G>, me: usize) {
+    println!();
+    println!("{}", t.recap_line(me));
     println!("{}", head_line(s));
+}
+
+/// A4's check: after replay, under the lock, before any duty.
+fn check_mark<G: Game>(
+    store: &Store,
+    s: &Session,
+    t: &Table<G>,
+    seat: usize,
+    sk: &ed25519_dalek::SigningKey,
+) -> Result<(), String> {
+    let raw = store.read_hw(&s.session_id, &t.seats[seat])?;
+    hw::check(s, &t.seats[seat], &sk.verifying_key(), raw.as_deref())
+}
+
+fn write_mark<G: Game>(
+    store: &Store,
+    s: &Session,
+    t: &Table<G>,
+    seat: usize,
+    sk: &ed25519_dalek::SigningKey,
+) -> Result<(), String> {
+    store.write_hw(&s.session_id, &t.seats[seat], &hw::mark(s, sk))
 }
 
 impl<G: Game> Driver for Engine<G> {
     fn create(&self, store: &Store, ruleset: Option<&str>) -> Result<(), String> {
         let rules = G::ruleset(ruleset.unwrap_or(G::DEFAULT_RULESET))?;
         let count = prompt_usize("How many players? [2]: ", 2)?;
-        if count < 2 {
-            return Err("need at least 2 players".into());
+        if !(2..=MAX_SEATS).contains(&count) {
+            return Err(format!("need 2 to {MAX_SEATS} players"));
         }
         let mut names = Vec::new();
         for i in 1..=count {
@@ -195,7 +234,7 @@ impl<G: Game> Driver for Engine<G> {
             let mut nonce = [0u8; 16];
             OsRng.fill_bytes(&mut nonce);
             let sid = keys::random_crockford(keys::SID_LEN);
-            let s = new_session::<G>(&sid, &rules, &names, nonce)?;
+            let s = new_session::<G>(&sid, &rules, &names, nonce).map_err(|e| escape(&e))?;
             if store.create(&s)? {
                 break s;
             }
@@ -226,6 +265,7 @@ impl<G: Game> Driver for Engine<G> {
         let pw = Password::generate(&t.session_id);
         let mut ctx = ctx_for(&pw);
         let sk = ctx.secrets.signing_key();
+        check_mark(store, &s, &t, seat, &sk)?;
         append_register(&mut s, &mut t, seat, &sk)?;
         let chain = if t.started() {
             apply_chain(&mut s, &mut t, seat, &[], &mut ctx, &sk)
@@ -236,6 +276,7 @@ impl<G: Game> Driver for Engine<G> {
             }
         };
         store.save(&s)?;
+        write_mark(store, &s, &t, seat, &sk)?;
 
         println!();
         println!(
@@ -247,16 +288,20 @@ impl<G: Game> Driver for Engine<G> {
         );
         println!("  PASSWORD (keep secret):  {}", pw.expose());
         println!();
-        println!("Load it into this terminal (paste it, then Enter):");
+        println!(
+            "Load it into this terminal: run this, paste the password at the silent prompt, Enter."
+        );
         println!("  {LOAD_HINT}");
+        println!("Then play with `zs play …` (plain `zs play` shows the table).");
         println!();
         print_steps(&chain, &t.names);
         if t.started() {
             println!("All players in.");
-            print_status(&s, &t, seat, &ctx);
+            print_status(&t, seat, &ctx);
         } else {
             println!("Waiting on: {}", t.unregistered().join(", "));
         }
+        print_whereabouts(&s, &t, seat);
         chain.failure.map_or(Ok(()), Err)
     }
 
@@ -277,7 +322,9 @@ impl<G: Game> Driver for Engine<G> {
                 t.session_id
             )
         })?;
+        check_mark(store, &s, &t, me, &sk)?;
         if !t.started() {
+            write_mark(store, &s, &t, me, &sk)?;
             return Err(format!(
                 "not everyone has registered yet (waiting on: {})",
                 t.unregistered().join(", ")
@@ -294,10 +341,12 @@ impl<G: Game> Driver for Engine<G> {
         if appended {
             store.save(&s)?;
         }
+        write_mark(store, &s, &t, me, &sk)?;
         print_steps(&chain, &t.names);
         if appended || tokens.is_empty() {
-            print_status(&s, &t, me, &ctx);
+            print_status(&t, me, &ctx);
         }
+        print_whereabouts(&s, &t, me);
         chain.failure.map_or(Ok(()), Err)
     }
 

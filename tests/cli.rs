@@ -130,7 +130,7 @@ fn a_two_player_session_end_to_end() {
     assert!(out(&o).contains("Waiting on: Bob"));
     let o = sb.run(&["register", &sid, "Bob"], "", None);
     let bob = after(&out(&o), "PASSWORD (keep secret):").to_string();
-    assert!(out(&o).contains("Alice's turn — roll: 0sum play roll"));
+    assert!(out(&o).contains("Alice's turn — roll: zs play roll"));
 
     let o = sb.run(&["play", "roll"], "", None);
     assert!(err(&o).contains("set ZEROSUM_PASSWORD"));
@@ -166,4 +166,107 @@ fn a_two_player_session_end_to_end() {
         "{}",
         out(&o)
     );
+}
+
+fn liars_dice_table(sb: &Sandbox) -> (String, String, String) {
+    let o = sb.run(&["new", "ld"], "2\nAlice\nBob\n", None);
+    assert!(o.status.success(), "{}", err(&o));
+    let sid = after(&out(&o), "SESSION ID:").to_string();
+    let o = sb.run(&["register", &sid, "Alice"], "", None);
+    assert!(
+        out(&o).contains(r#"read -rs ZP; zs() { ZEROSUM_PASSWORD="$ZP" 0sum "$@"; }"#),
+        "{}",
+        out(&o)
+    );
+    assert!(!out(&o).contains("export"));
+    let alice = after(&out(&o), "PASSWORD (keep secret):").to_string();
+    let o = sb.run(&["register", &sid, "Bob"], "", None);
+    assert!(out(&o).contains("Bob committed to round 1 dice"));
+    let bob = after(&out(&o), "PASSWORD (keep secret):").to_string();
+    (sid, alice, bob)
+}
+
+#[test]
+fn liars_dice_two_terminals_to_a_winner() {
+    let sb = Sandbox::new();
+    let (sid, alice, bob) = liars_dice_table(&sb);
+    let pws = [&alice, &bob];
+    let mut winner = None;
+    'game: for _ in 0..100 {
+        for pw in pws {
+            let o = sb.run(&["play"], "", Some(pw));
+            assert!(o.status.success(), "{}", err(&o));
+            let text = out(&o);
+            assert!(text.contains("\nhead "), "{text}");
+            assert!(text.contains("your last move: "), "{text}");
+            if let Some(line) = text.lines().find(|l| l.contains("WINS!")) {
+                winner = Some(line.to_string());
+                break 'game;
+            }
+            if text.contains("Your move") {
+                let mv: &[&str] = if text.contains("(beat ") {
+                    &["play", "liar"]
+                } else {
+                    &["play", "bid", "1", "2"]
+                };
+                let o = sb.run(mv, "", Some(pw));
+                assert!(o.status.success(), "{}{}", out(&o), err(&o));
+            }
+        }
+    }
+    let winner = winner.expect("the game ends");
+    assert!(winner.contains("Alice") || winner.contains("Bob"));
+    let o = sb.run(&["verify", &sid], "", None);
+    assert!(o.status.success(), "{}", out(&o));
+    assert!(out(&o).contains("wins the game!"));
+    assert!(out(&o).lines().last().unwrap().starts_with("OK  "));
+}
+
+/// A4 against §12.2's harvest attack: Bob snapshots, calls, Alice's duty
+/// reveals her dice, Bob restores the snapshot. Alice's next run refuses
+/// and writes nothing.
+#[test]
+fn a_rolled_back_log_is_refused_with_rollback() {
+    let sb = Sandbox::new();
+    let (sid, alice, bob) = liars_dice_table(&sb);
+    sb.run(&["play"], "", Some(&alice)); // 4 commit, 5 entropy
+    sb.run(&["play"], "", Some(&bob)); // 6 entropy
+    let o = sb.run(&["play", "bid", "1", "2"], "", Some(&alice)); // 7
+    assert!(o.status.success(), "{}", err(&o));
+
+    let path = sb.root().join(format!("sessions/{sid}.json"));
+    let snapshot = fs::read_to_string(&path).unwrap();
+    let o = sb.run(&["play", "liar"], "", Some(&bob)); // 8 call, 9 reveal, 10 commit
+    assert!(out(&o).contains("waiting on Alice's reveal"), "{}", out(&o));
+    let o = sb.run(&["play"], "", Some(&alice)); // 11 reveal → resolve, 12, 13
+    assert!(out(&o).contains("Round 1 result: Bob called liar on Alice's 1×2."));
+    assert!(out(&o).contains("head 13:"));
+
+    fs::write(&path, &snapshot).unwrap();
+    let mark = sb.root().join(format!("sessions/{sid}.p1.hw"));
+    let mark_before = fs::read(&mark).unwrap();
+    let o = sb.run(&["play"], "", Some(&alice));
+    assert_eq!(o.status.code(), Some(1));
+    assert!(
+        err(&o).contains("ROLLBACK: you last saw seq 13:")
+            && err(&o).contains("this log no longer contains it. Don't play on. Run 0sum verify."),
+        "{}",
+        err(&o)
+    );
+    assert_eq!(fs::read_to_string(&path).unwrap(), snapshot);
+    assert_eq!(fs::read(&mark).unwrap(), mark_before);
+
+    // The restored log is itself valid: only the mark can tell.
+    let o = sb.run(&["verify", &sid], "", None);
+    assert!(o.status.success());
+}
+
+#[test]
+fn new_rejects_names_that_could_carry_escapes() {
+    let sb = Sandbox::new();
+    let o = sb.run(&["new", "ld"], "2\nAlice\nBob\x1b[2J\n", None);
+    assert!(!o.status.success());
+    assert!(err(&o).contains(r"Bob\u{1b}[2J"), "{}", err(&o));
+    assert!(!err(&o).contains('\x1b'));
+    assert!(sb.sessions().is_empty());
 }

@@ -126,10 +126,6 @@ impl Secrets {
 
     /// A game secret. `info` must be `0sum/v2/<game-id>/...`, which also keeps
     /// it disjoint from the engine's own labels (`0sum/v2/sign`, `0sum/v2/state-key`).
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "first caller is Liar's Dice (PHASE2 §2.2)")
-    )]
     pub fn derive(&self, info: &[u8]) -> [u8; 32] {
         let rest = info
             .strip_prefix(b"0sum/v2/".as_slice())

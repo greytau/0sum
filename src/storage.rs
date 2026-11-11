@@ -7,6 +7,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 
+use crate::engine::escape;
+use crate::engine::hw::HighWater;
 use crate::engine::log::Session;
 
 pub enum LoadError {
@@ -130,23 +132,34 @@ impl Store {
 
     /// Atomic: write `<SID>.json.tmp` (0600), then rename over `<SID>.json`.
     pub fn save(&self, s: &Session) -> Result<(), String> {
-        let path = self.session_path(&s.session_id);
-        let tmp = path.with_extension("json.tmp");
-        let mut f = private_file(OpenOptions::new().write(true).create(true).truncate(true))
-            .open(&tmp)
-            .map_err(|e| format!("open {}: {e}", tmp.display()))?;
-        set_mode(&tmp, 0o600)?;
-        f.write_all(json(s)?.as_bytes())
-            .and_then(|_| f.sync_all())
-            .map_err(|e| format!("write {}: {e}", tmp.display()))?;
-        fs::rename(&tmp, &path).map_err(|e| format!("rename into {}: {e}", path.display()))
+        atomic_write(&self.session_path(&s.session_id), &json(s)?)
+    }
+
+    fn hw_path(&self, sid: &str, seat: &str) -> PathBuf {
+        self.sessions().join(format!("{sid}.{seat}.hw"))
+    }
+
+    /// The seat's high-water mark file (A4), if there is one.
+    pub fn read_hw(&self, sid: &str, seat: &str) -> Result<Option<String>, String> {
+        let path = self.hw_path(sid, seat);
+        match fs::read_to_string(&path) {
+            Ok(t) => Ok(Some(t)),
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(format!("read {}: {e}", path.display())),
+        }
+    }
+
+    pub fn write_hw(&self, sid: &str, seat: &str, hw: &HighWater) -> Result<(), String> {
+        let text = serde_json::to_string(hw).map_err(|e| format!("serialize mark: {e}"))?;
+        atomic_write(&self.hw_path(sid, seat), &text)
     }
 
     pub fn load(&self, sid: &str) -> Result<Session, LoadError> {
         let path = self.session_path(sid);
         let text = fs::read_to_string(&path)
             .map_err(|_| LoadError::Missing(format!("no session `{sid}` found")))?;
-        let corrupt = |e: String| LoadError::Corrupt(format!("session file doesn't parse: {e}"));
+        let corrupt =
+            |e: String| LoadError::Corrupt(format!("session file doesn't parse: {}", escape(&e)));
         let raw: serde_json::Value =
             serde_json::from_str(&text).map_err(|e| corrupt(e.to_string()))?;
         if raw.get("version") == Some(&serde_json::json!(1)) {
@@ -158,12 +171,26 @@ impl Store {
         if s.session_id != sid {
             return Err(LoadError::Corrupt(format!(
                 "{sid}.json claims to be session {}",
-                s.session_id
+                escape(&s.session_id)
             )));
         }
         set_mode(&path, 0o600).map_err(LoadError::Corrupt)?;
         Ok(s)
     }
+}
+
+fn atomic_write(path: &Path, text: &str) -> Result<(), String> {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    let mut f = private_file(OpenOptions::new().write(true).create(true).truncate(true))
+        .open(&tmp)
+        .map_err(|e| format!("open {}: {e}", tmp.display()))?;
+    set_mode(&tmp, 0o600)?;
+    f.write_all(text.as_bytes())
+        .and_then(|_| f.sync_all())
+        .map_err(|e| format!("write {}: {e}", tmp.display()))?;
+    fs::rename(&tmp, path).map_err(|e| format!("rename into {}: {e}", path.display()))
 }
 
 fn json(s: &Session) -> Result<String, String> {

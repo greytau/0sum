@@ -1,6 +1,7 @@
 //! The game-agnostic engine (PHASE2 §9): the `Game` trait, replay-as-verify,
 //! signed append, and `apply_chain` (issue #8's seam). No I/O lives here.
 
+pub mod hw;
 pub mod keys;
 pub mod log;
 
@@ -15,10 +16,6 @@ use keys::Secrets;
 use log::{now, Body, Entry, Genesis, Hex, Hex32, Register, Seat, Session, VERSION};
 
 pub struct SessionInfo {
-    #[expect(
-        dead_code,
-        reason = "Liar's Dice binds commitments to the SID (PHASE2 §4.1)"
-    )]
     pub session_id: String,
     pub seats: Vec<String>,
 }
@@ -26,13 +23,14 @@ pub struct SessionInfo {
 pub trait Game: 'static {
     const ID: &'static str;
     const DEFAULT_RULESET: &'static str;
-    type Rules: Serialize + DeserializeOwned + Clone;
+    type Rules: Serialize + DeserializeOwned + Clone + PartialEq;
     type State: Clone;
     type Move: Clone + Debug + PartialEq;
     /// Must be `#[serde(deny_unknown_fields)]`: replay parses it strictly.
     type Event: Serialize + DeserializeOwned + Clone + Debug;
 
     fn ruleset(name: &str) -> Result<Self::Rules, String>;
+    fn rules_name(rules: &Self::Rules) -> &str;
     /// One line for new/register output.
     fn describe(rules: &Self::Rules) -> String;
     fn initial(rules: Self::Rules, info: &SessionInfo) -> Self::State;
@@ -77,6 +75,15 @@ pub trait Game: 'static {
         me: Option<usize>,
         ctx: Option<&Ctx>,
     ) -> String;
+
+    /// The author's own event in words, for `your last move:` (A4).
+    /// `None` = a protocol entry, not something a human chose.
+    fn recap(before: &Self::State, ev: &Self::Event, names: &[String]) -> Option<String>;
+
+    /// Where in the game `before` is, e.g. `round 2`, to place a recap.
+    fn moment(_before: &Self::State) -> Option<String> {
+        None
+    }
 }
 
 pub struct Ctx {
@@ -92,6 +99,8 @@ pub struct Table<G: Game> {
     pub keys: Vec<Option<VerifyingKey>>,
     pub state: G::State,
     pub head: Hex32,
+    /// Per seat: (seq, words) of the last thing that seat chose to do.
+    pub last_move: Vec<Option<(u64, String)>>,
 }
 
 impl<G: Game> Table<G> {
@@ -101,6 +110,23 @@ impl<G: Game> Table<G> {
 
     pub fn seat_of(&self, key: &VerifyingKey) -> Option<usize> {
         self.keys.iter().position(|k| k.as_ref() == Some(key))
+    }
+
+    /// `your last move: …` plus the head, printed on every invocation so a
+    /// rolled-back log is visible to the human, not only to the mark (A4).
+    pub fn recap_line(&self, seat: usize) -> String {
+        match &self.last_move[seat] {
+            Some((_, words)) => format!("your last move: {words}"),
+            None => "your last move: none yet".into(),
+        }
+    }
+
+    fn note_move(&mut self, seat: usize, seq: u64, words: String, at: Option<String>) {
+        let tag = match at {
+            Some(at) => format!("{at}, seq {seq}"),
+            None => format!("seq {seq}"),
+        };
+        self.last_move[seat] = Some((seq, format!("{words} ({tag})")));
     }
 
     pub fn unregistered(&self) -> Vec<&str> {
@@ -119,9 +145,22 @@ pub struct Broken {
     pub reason: String,
 }
 
+/// File-derived text, made inert for a terminal (A6): every char through
+/// `char::escape_debug`, newlines included, so file text can neither emit a
+/// control sequence nor forge an output line. Quotes alone pass through:
+/// they're harmless, and `doesn\'t` in every BROKEN line helps nobody.
+pub fn escape(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            '\'' | '"' => c.to_string(),
+            c => c.escape_debug().to_string(),
+        })
+        .collect()
+}
+
 impl fmt::Display for Broken {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "BROKEN at seq {}: {}", self.seq, self.reason)
+        write!(f, "BROKEN at seq {}: {}", self.seq, escape(&self.reason))
     }
 }
 
@@ -132,15 +171,32 @@ fn broken<T>(seq: u64, reason: impl Into<String>) -> Result<T, Broken> {
     })
 }
 
-/// Seat names: at least two, non-empty, unique case-insensitively (register
-/// matches names case-insensitively, so `Alice`/`alice` would deadlock a seat).
+pub const MAX_SEATS: usize = 8;
+
+/// `^[A-Za-z0-9][A-Za-z0-9 _.-]{0,23}$` (A6): names reach other players'
+/// terminals, so they carry no escapes, quotes or shell metacharacters.
+pub fn valid_name(n: &str) -> bool {
+    let b = n.as_bytes();
+    (1..=24).contains(&b.len())
+        && b[0].is_ascii_alphanumeric()
+        && b[1..]
+            .iter()
+            .all(|&c| c.is_ascii_alphanumeric() || b" _.-".contains(&c))
+}
+
+/// 2..=8 seats; names match [`valid_name`] and are unique case-insensitively
+/// (register matches names case-insensitively, so `Alice`/`alice` would
+/// deadlock a seat).
 pub fn check_roster(names: &[String]) -> Result<(), String> {
-    if names.len() < 2 {
-        return Err("need at least 2 players".into());
+    if !(2..=MAX_SEATS).contains(&names.len()) {
+        return Err(format!("need 2 to {MAX_SEATS} players"));
     }
     for (i, n) in names.iter().enumerate() {
-        if n.trim().is_empty() {
-            return Err(format!("player {} has an empty name", i + 1));
+        if !valid_name(n) {
+            return Err(format!(
+                "player {} name `{n}` isn't allowed (1-24 of A-Z a-z 0-9 space _ . -, starting with a letter or digit)",
+                i + 1
+            ));
         }
         if names[..i].iter().any(|m| m.eq_ignore_ascii_case(n)) {
             return Err(format!(
@@ -250,9 +306,20 @@ fn replay_inner<G: Game>(
     }
     let rules: G::Rules = serde_json::from_value(g.ruleset.clone())
         .or_else(|e| broken(0, format!("ruleset doesn't parse: {e}")))?;
+    let builtin = G::ruleset(G::rules_name(&rules)).or_else(|e| broken(0, e))?;
+    if rules != builtin {
+        return broken(
+            0,
+            format!(
+                "ruleset `{}` differs from the built-in one of that name",
+                G::rules_name(&rules)
+            ),
+        );
+    }
     let names: Vec<String> = g.roster.iter().map(|r| r.name.clone()).collect();
     let seats: Vec<String> = g.roster.iter().map(|r| r.seat.clone()).collect();
     check_roster(&names).or_else(|e| broken(0, e))?;
+    let names: Vec<String> = names.iter().map(|n| escape(n)).collect();
     if seats
         .iter()
         .enumerate()
@@ -268,7 +335,7 @@ fn replay_inner<G: Game>(
         let roster: Vec<String> = g
             .roster
             .iter()
-            .map(|r| format!("{} {}", r.seat, r.name))
+            .map(|r| format!("{} {}", r.seat, escape(&r.name)))
             .collect();
         out.push(format!(
             "{:>4}  genesis: {}; seats: {}",
@@ -282,6 +349,7 @@ fn replay_inner<G: Game>(
         state: G::initial(rules.clone(), &info),
         rules,
         keys: vec![None; seats.len()],
+        last_move: vec![None; names.len()],
         names,
         seats,
         head: first.hash,
@@ -318,6 +386,7 @@ fn replay_inner<G: Game>(
                 }
                 e.verify_sig(&key).or_else(|r| broken(i, r))?;
                 t.keys[seat] = Some(key);
+                t.note_move(seat, i, "registered".into(), None);
                 if let Some(out) = out.as_deref_mut() {
                     out.push(format!(
                         "{i:>4}  {} registered (key {})",
@@ -339,7 +408,11 @@ fn replay_inner<G: Game>(
                 let ev: G::Event = serde_json::from_value(v.clone())
                     .or_else(|e| broken(i, format!("event doesn't parse: {e}")))?;
                 let before = out.is_some().then(|| t.state.clone());
+                let recap = G::recap(&t.state, &ev, &t.names).map(|w| (w, G::moment(&t.state)));
                 G::fold(&mut t.state, seat, &ev).or_else(|r| broken(i, r))?;
+                if let Some((words, at)) = recap {
+                    t.note_move(seat, i, words, at);
+                }
                 if let (Some(out), Some(before)) = (out.as_deref_mut(), before) {
                     for line in G::narrate(&before, seat, &ev, &t.state, &t.names) {
                         out.push(format!("{i:>4}  {line}"));
@@ -370,10 +443,12 @@ pub fn append_register<G: Game>(
         seat: t.seats[seat].clone(),
         pubkey: Hex(key.to_bytes()),
     });
-    let e = Entry::signed(s.log.len() as u64, now(), &t.seats[seat], t.head, body, sk);
+    let seq = s.log.len() as u64;
+    let e = Entry::signed(seq, now(), &t.seats[seat], t.head, body, sk);
     t.head = e.hash;
     s.log.push(e);
     t.keys[seat] = Some(key);
+    t.note_move(seat, seq, "registered".into(), None);
     Ok(())
 }
 
@@ -389,18 +464,16 @@ pub fn append<G: Game>(
     debug_assert_eq!(t.keys[author], Some(sk.verifying_key()));
     let mut next = t.state.clone();
     G::fold(&mut next, author, &ev)?;
+    let recap = G::recap(&t.state, &ev, &t.names).map(|w| (w, G::moment(&t.state)));
     let body = Body::Game(serde_json::to_value(&ev).map_err(|e| format!("serialize event: {e}"))?);
-    let e = Entry::signed(
-        s.log.len() as u64,
-        now(),
-        &t.seats[author],
-        t.head,
-        body,
-        sk,
-    );
+    let seq = s.log.len() as u64;
+    let e = Entry::signed(seq, now(), &t.seats[author], t.head, body, sk);
     t.head = e.hash;
     s.log.push(e);
     t.state = next;
+    if let Some((words, at)) = recap {
+        t.note_move(author, seq, words, at);
+    }
     Ok(())
 }
 
@@ -664,7 +737,7 @@ mod tests {
         let Body::Genesis(g) = &mut s.log[0].body else {
             unreachable!()
         };
-        g.ruleset["target_score"] = json!(100);
+        g.ruleset = serde_json::to_value(RuleSet::classic()).unwrap();
         assert_eq!(broken_at(&s).seq, 0);
         rehash(&mut s.log[0]);
         assert_eq!(
@@ -739,6 +812,64 @@ mod tests {
         assert_eq!(
             broken_at(&s).to_string(),
             "BROKEN at seq 2: game move before every seat registered"
+        );
+    }
+
+    #[test]
+    fn file_text_is_made_inert() {
+        assert_eq!(
+            escape("Bob\u{1b}[2J\nOK  9 entries"),
+            "Bob\\u{1b}[2J\\nOK  9 entries"
+        );
+        assert_eq!(escape("doesn't \"x\" é ×"), "doesn't \"x\" é ×");
+        let b = Broken {
+            seq: 0,
+            reason: "unknown field `\u{7}`".into(),
+        };
+        assert_eq!(b.to_string(), "BROKEN at seq 0: unknown field `\\u{7}`");
+    }
+
+    #[test]
+    fn roster_rules_seats_and_names() {
+        let names = |v: &[&str]| v.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+        assert!(check_roster(&names(&["Al Ice", "b.o_b-2"])).is_ok());
+        assert!(check_roster(&names(&["Alice", " Bob"])).is_err());
+        assert!(check_roster(&names(&["Alice", "Bob\u{1b}[31m"])).is_err());
+        assert!(check_roster(&names(&["Alice", "Bob;rm"])).is_err());
+        assert!(check_roster(&names(&["Alice", &"x".repeat(25)])).is_err());
+        assert!(check_roster(&names(&["Alice", &"x".repeat(24)])).is_ok());
+        let nine: Vec<String> = (1..=9).map(|i| format!("P{i}")).collect();
+        assert_eq!(check_roster(&nine).unwrap_err(), "need 2 to 8 players");
+        assert!(check_roster(&nine[..8]).is_ok());
+    }
+
+    /// A6/A7 at verify: a doctored genesis is BROKEN, and its text is inert.
+    #[test]
+    fn verify_refuses_bad_names_and_doctored_rulesets() {
+        let mut s = played();
+        s.log.truncate(1);
+        let Body::Genesis(g) = &mut s.log[0].body else {
+            unreachable!()
+        };
+        g.roster[1].name = "Bob\u{1b}]0;pwned\u{7}".into();
+        rehash(&mut s.log[0]);
+        let b = broken_at(&s).to_string();
+        assert!(
+            b.starts_with("BROKEN at seq 0: player 2 name `Bob\\u{1b}]0;pwned\\u{7}`"),
+            "{b}"
+        );
+        assert!(!b.contains('\u{1b}'));
+
+        let mut s = played();
+        s.log.truncate(1);
+        let Body::Genesis(g) = &mut s.log[0].body else {
+            unreachable!()
+        };
+        g.ruleset["target_score"] = json!(100);
+        rehash(&mut s.log[0]);
+        assert_eq!(
+            broken_at(&s).to_string(),
+            "BROKEN at seq 0: ruleset `kcd` differs from the built-in one of that name"
         );
     }
 

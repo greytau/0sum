@@ -92,6 +92,10 @@ impl Game for Farkle {
         RuleSet::by_name(name)
     }
 
+    fn rules_name(rules: &RuleSet) -> &str {
+        &rules.name
+    }
+
     fn describe(rules: &RuleSet) -> String {
         format!(
             "Farkle, ruleset {} (target {})",
@@ -281,6 +285,14 @@ impl Game for Farkle {
         }
     }
 
+    fn recap(before: &State, ev: &Event, _names: &[String]) -> Option<String> {
+        Some(match ev {
+            Event::Rolled { dice } => format!("rolled {}", fmt_dice(dice)),
+            Event::Kept { dice } => format!("kept {}", fmt_dice(dice)),
+            Event::Banked {} => format!("banked {}", before.turn_total),
+        })
+    }
+
     fn render(st: &State, names: &[String], _me: Option<usize>, _ctx: Option<&Ctx>) -> String {
         let mut out = vec![format!("--- scores (target {}) ---", st.rules.target_score)];
         let current = st.winner.is_none();
@@ -307,13 +319,13 @@ impl Game for Farkle {
 
 fn next_hint(st: &State, name: &str) -> String {
     match st.phase {
-        Phase::AwaitRoll => format!("{name}'s turn — roll: 0sum play roll"),
+        Phase::AwaitRoll => format!("{name}'s turn — roll: zs play roll"),
         Phase::AwaitKeep => format!(
-            "{name}: keep scoring dice from {}, e.g. 0sum play keep <dice...>",
+            "{name}: keep scoring dice from {}, e.g. zs play keep <dice...>",
             fmt_dice(&st.table)
         ),
         Phase::AwaitRollOrBank => format!(
-            "{name}: roll again ({} dice) or bank {} — 0sum play roll | bank",
+            "{name}: roll again ({} dice) or bank {} — zs play roll | bank",
             st.dice_available, st.turn_total
         ),
         Phase::GameOver => "game over".into(),
@@ -577,12 +589,12 @@ pub(crate) mod tests {
 
     #[test]
     fn chain_win_halts_and_reports() {
-        let rules = RuleSet {
-            target_score: 50,
-            ..RuleSet::kcd()
-        };
+        let rules = RuleSet::kcd();
         let seed = seed_where(&rules, |scores| scores);
         let (mut s, mut t, mut players) = seated::<Farkle>(&rules, &["Alice", "Bob"]);
+        // One scoring keep from the win. (Only in memory: a doctored
+        // ruleset or total would rightly fail replay.)
+        t.state.totals[0] = rules.target_score - 50;
         players[0].ctx.rng = StdRng::seed_from_u64(seed);
         let keep = best_keep(&roll_with(seed, 6), &rules);
 
@@ -597,7 +609,6 @@ pub(crate) mod tests {
         assert_eq!(chain.steps.len(), 3);
         assert_eq!(Farkle::winner(&t.state), Some(0));
         assert!(Farkle::render(&t.state, &t.names, Some(0), None).ends_with(">>> Alice WINS! <<<"));
-        assert_eq!(replay::<Farkle>(&s).unwrap().state, t.state);
     }
 
     #[test]
@@ -614,6 +625,6 @@ pub(crate) mod tests {
     fn hints_name_the_new_cli() {
         let (_, t, _) = seated::<Farkle>(&RuleSet::kcd(), &["Alice", "Bob"]);
         assert!(Farkle::render(&t.state, &t.names, None, None)
-            .ends_with("Alice's turn — roll: 0sum play roll"));
+            .ends_with("Alice's turn — roll: zs play roll"));
     }
 }

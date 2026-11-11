@@ -3,6 +3,9 @@
 > Build spec. Commit this as `docs/PHASE2.md`. It replaces the "planned" crypto in
 > `docs/DESIGN.md` with a concrete design. Written against `origin/main` @ `48441ca`.
 > Breaking changes to the session format and CLI are pre-cleared. v1 sessions are not migrated.
+>
+> Amendments A1–A9 (2026-11-11, from review and Honeypot's security audit) are folded into the
+> text below; each is tagged where it lands. This is the design as built.
 
 ---
 
@@ -20,7 +23,8 @@ Hidden dice use a two-phase commit/entropy protocol with deterministic derivatio
 
 1. Every live player commits to a secret `s` that is derived from their password.
 2. Only once *all* commitments are in, every player publishes an entropy value `n`.
-   This is also derived deterministically, from their password and the commitment set.
+   This is also deterministic: a hash of their own secret `s` and the commitment set, so it
+   is checked against `s` at reveal (A3).
 3. Your dice = `PRF(your s, everyone else's n)`, using rejection sampling, so there is no
    modulo bias. Your own `n` never feeds your own dice.
 4. A challenge makes every live player reveal `s`. Anyone can then check `s` against the
@@ -46,7 +50,7 @@ A player might also run a modified binary.
 |---|----------|-----------|
 | G1 | Reading the disk reveals no password, no secret, no unrevealed die | Nothing secret is stored. The disk holds only pubkeys, commitments, entropy and signatures. |
 | G2 | Nobody can forge, alter, reorder, or re-attribute another player's entry | SHA-256 hash chain plus a per-entry Ed25519 signature by the author |
-| G3 | Nobody can choose or bias their own dice | Commit-before-entropy ordering (enforced in the log), own entropy excluded, rejection sampling |
+| G3 | Nobody can choose or bias their own dice, or a partner's | Commit-before-entropy ordering (enforced in the log), own entropy excluded, entropy bound to the committed `s` and checked at reveal (A3), rejection sampling |
 | G4 | Nobody sees anyone else's dice before reveal, the roller included | Dice need the owner's secret `s`, which never leaves the owner's password |
 | G5 | Every reveal and every challenge outcome is verifiable from the log alone | `s` is checked against the commitment, dice are re-derived, the count is recomputed |
 | G6 | Signers can't sign illegal moves either | Every game event is replayed through the game's `fold`, which validates legality |
@@ -70,7 +74,9 @@ example: TEST01-AAAAAAAAAAAAAAAAAAAAAAAAAA
   32 is a power of two, so there is no bias.
 - Parse: trim, ASCII-uppercase, split once on `-`, then validate both alphabets and lengths.
 - The password is **only** ever minted by `0sum register`. There is no path that accepts a
-  user-chosen password, and this is load-bearing (see 2.3).
+  user-chosen password, and this is load-bearing (see 2.3). (A8) Any fixed-secret `Password`
+  constructor or fixed-password register path exists under `#[cfg(test)]` only; no
+  CLI-reachable path accepts a supplied secret.
 - `Password` gets a hand-written `Debug` that prints `TEST01-<redacted>`.
 
 ### 2.2 Derivation (HKDF-SHA256)
@@ -87,9 +93,13 @@ Liar's Dice labels (`r` = round number as big-endian u32, `‖` = concat):
 
 ```
 s_i^r = HKDF-Expand(prk_i, "0sum/v2/liars-dice/secret"  ‖ u32be(r), 32)
-n_i^r = HKDF-Expand(prk_i, "0sum/v2/liars-dice/entropy" ‖ u32be(r) ‖ CSET^r, 32)
+n_i^r = SHA-256("0sum/v2/liars-dice/entropy\0" ‖ lp(SID) ‖ u32be(r) ‖ lp(seat_i) ‖ s_i^r ‖ CSET^r)   (A3)
 CSET^r = SHA-256( C_k^r for every live seat k, in seat order, raw 32 bytes each )
 ```
+
+(A3) `n` is a hash of the seat's own `s`, not a separate HKDF output, so once `s` is revealed
+anyone can check that the published `n` is the only value that seat could have published
+(§4.3). `lp` is defined in §4.1.
 
 The engine exposes this as a `Secrets` handle (§9.3). Games call
 `secrets.derive(info)`, and `info` MUST start with `0sum/v2/<game-id>/`.
@@ -113,7 +123,7 @@ writes `~/.0sum/index.json`: there's no file to dump, key, or chmod.
 - `play` parses SID from the password and loads `sessions/<SID>.json`.
 - It derives the pubkey, then finds the seat whose `register` entry carries that pubkey.
 - If no seat matches, the error is `this password doesn't belong to any seat in session <SID>`.
-- **Amended (ruling, 2026-11-11): the legacy index is never deleted.** Real v1 games may still
+- **(A1) The legacy index is never deleted.** Real v1 games may still
   live under `~/.0sum`. If a legacy `index.json` exists, print one line to stderr and touch
   nothing (no deletion, no chmod of v1 files):
   `warning: legacy v1 index.json at <path> holds plaintext passwords; v2 doesn't use it — delete it yourself when you're done with v1 games`.
@@ -123,17 +133,23 @@ writes `~/.0sum/index.json`: there's no file to dump, key, or chmod.
 ### 2.5 The password never goes on the command line
 
 A positional `play <password>` writes the password into shell history, and shell history is
-on the shared disk, which breaks G1. So the password comes **only** from the environment
-variable `ZEROSUM_PASSWORD`. (An env var name can't start with a digit.)
+on the shared disk, which breaks G1. So the binary reads the password **only** from the
+environment variable `ZEROSUM_PASSWORD`. (An env var name can't start with a digit.)
+
+(A5) Never `export` it: an exported variable rides into the environment of every process
+that shell starts. Keep it in an unexported shell variable and hand it to `0sum` alone:
 
 ```console
-$ read -rs ZEROSUM_PASSWORD && export ZEROSUM_PASSWORD   # once per terminal, paste, Enter
-$ 0sum play bid 3 5
+$ read -rs ZP; zs() { ZEROSUM_PASSWORD="$ZP" 0sum "$@"; }   # once per terminal, paste, Enter
+$ zs play bid 3 5
 ```
 
+- The register hint, the unset-variable error, the in-game hints and the README all use
+  this wrapper and never recommend `export`. The binary's behavior is unchanged.
 - An agent player whose shell doesn't persist can prefix per command:
   `ZEROSUM_PASSWORD=... 0sum play bid 3 5`. Non-interactive shells write no history.
-- If the variable is unset: error `set ZEROSUM_PASSWORD (read -rs ZEROSUM_PASSWORD && export ZEROSUM_PASSWORD)`.
+- If the variable is unset: error
+  ``set ZEROSUM_PASSWORD — in this terminal run `read -rs ZP; zs() { ZEROSUM_PASSWORD="$ZP" 0sum "$@"; }`, paste your password, then use `zs play …` ``.
 - If the first move token parses as a password (`^[0-9A-Z]{6}-[0-9A-Z]{26}$`
   case-insensitive), refuse with: `don't put your password on the command line — it's in
   your shell history now; use ZEROSUM_PASSWORD`. Do not act on it.
@@ -221,8 +237,10 @@ is unsigned because nobody has keys yet. It gets locked by the first `register`,
 2. For each entry `i`: `seq == i`; `prev == hash(log[i-1])` (zeros for `i = 0`);
    `hash == h(entry)` (recomputed).
 3. **Genesis.** Only at `seq 0`. `author == None`, `sig == None`. `game` is in the registry.
-   `ruleset` parses as `G::Rules`. Roster has ≥ 2 seats, seat ids are exactly `p1..pN` in
-   order, and names are unique case-insensitively.
+   `ruleset` parses as `G::Rules` **and equals `G::ruleset(&ruleset.name)`**, the built-in of
+   that name (A7). Roster has **2 to 8** seats (A7), seat ids are exactly `p1..pN` in order,
+   every name matches `^[A-Za-z0-9][A-Za-z0-9 _.-]{0,23}$` (A6), and names are unique
+   case-insensitively.
 4. **Register.** `author == Some(seat)`. The seat exists and isn't registered yet. `pubkey` is a
    valid point not used by any other seat. `sig` verifies under **that** pubkey (proof of possession).
 5. **Game.** Every seat is registered (the game has started). `author` is a registered seat.
@@ -231,6 +249,12 @@ is unsigned because nobody has keys yet. It gets locked by the first `register`,
    Liar's Dice commit/entropy-ordering/reveal/dice checks.
 6. Success: print `OK  <N> entries  head <seq>:<first 12 hex of hash>`.
    Failure: print `BROKEN at seq <i>: <reason>` and exit 1.
+
+(A6) Every string that came from the file (names, `Broken.reason`, serde error text) is
+printed through `escape_debug`, so a doctored file can't send terminal escape sequences or
+forge an output line. As built, `'` and `"` pass through unescaped (they're inert, and
+`doesn\'t` in every BROKEN line helps nobody); every other char, newlines included, goes
+through `char::escape_debug`.
 
 `ts` is never checked. It is self-reported, so it's display-only.
 
@@ -280,7 +304,10 @@ Consequences, each addressed explicitly:
   (256-bit preimages). No entropy exists yet. Committing last is worth nothing.
 - **Last entropy publisher.** Your `n_i` never enters your own dice (`k ≠ i`). You can't predict
   other players' dice without their `s`, so choosing your `n_i` adversarially is pointless.
-  This holds for colluding groups too: colluders still don't know an outsider's `s`.
+  Colluders are different: a partner who knows your `s` could grind *their* `n` to pick *your*
+  dice. So (A3) `n` isn't free: it's a hash of the publisher's own committed `s` and the
+  commitment set, and `fold` checks it at reveal. Every `n` is fixed the moment the
+  commitments are, for colluders too.
 - **Rollback grinding, honest binary.** `s_i^r` is a function of (password, r). `n_i^r` is a
   function of (password, r, commitment set). Roll the file back to any earlier point and an
   honest binary republishes **byte-identical** commits and entropy, so the same dice come out.
@@ -289,8 +316,8 @@ Consequences, each addressed explicitly:
 - **Rollback grinding, modified binary.** A cheater can roll back to before their own commit and
   commit a fresh secret. Because `n_k` is bound to the commitment set, the honest opponent's
   binary then produces a fresh, unpredictable `n_k`. The cheater gets a random *re-draw* and
-  still can't *choose*. They also need the opponent to re-run without noticing that the log
-  lost entries (§12).
+  still can't *choose*. They also need the opponent's binary to accept the shortened log,
+  which the high-water mark (§6.1, A4) refuses unless the whole directory was snapshotted (§12).
 - **Abort / last revealer.** There is **no re-roll mechanism** in the rules. A committed round
   must complete. The only leverage a player gets from refusing to publish entropy or reveal
   is stalling the game forever, which is "flipping the table" (§12). There's no better outcome
@@ -300,13 +327,11 @@ Consequences, each addressed explicitly:
 ### 4.3 Reveal & verification
 
 Once a call (`liar`/`spot`) is made, every live seat appends `reveal{r, s}`. `fold` checks
-`C(s) == commits[author]`, then derives that seat's dice from `s` and the logged entropy of
-the other live seats. When the last live seat has revealed, `fold` resolves the round (§10).
-All of this is pure computation over the log, so any verifier reproduces it exactly (G5).
-
-Nobody can verify that `n_k` was *derived from k's password*. It's a keyed PRF, and it doesn't
-need verifying, because the security argument above never relies on it. (A VRF would make it
-checkable, but buys nothing here.)
+`C(s) == commits[author]`, then (A3) that the seat's logged `entropy` equals
+`n(SID, r, seat, s, CSET^r)`, else `entropy for round <r> doesn't match the revealed secret`.
+Then it derives that seat's dice from `s` and the logged entropy of the other live seats. When
+the last live seat has revealed, `fold` resolves the round (§10). All of this is pure
+computation over the log, so any verifier reproduces it exactly (G5).
 
 ---
 
@@ -334,6 +359,7 @@ $XDG_CONFIG_HOME/0sum or ~/.0sum/        mode 0700
   sessions/                              mode 0700
     <SID>.json                           mode 0600   the session (the only state)
     <SID>.lock                           mode 0600   advisory lock target, empty
+    <SID>.<seat>.hw                      mode 0600   that seat's signed high-water mark (A4)
 ```
 
 - **Modes** (`#[cfg(unix)]`). Create dirs with `DirBuilder::mode(0o700)`. On *every* run, also
@@ -351,6 +377,33 @@ $XDG_CONFIG_HOME/0sum or ~/.0sum/        mode 0700
 - **`new`** generates SIDs until `OpenOptions::create_new` succeeds on `<SID>.json`.
 - **v1 files** (`"version": 1`) error out with: `session <SID> is a v1 (unsigned) session and can't be played by this version — start a new one`.
 
+### 6.1 The high-water mark (A4)
+
+Every prefix of a valid log is itself valid, so the log alone can't show it was cut back
+(§12.2). Each seat keeps a mark of the last head it saw, signed with its own key:
+
+```
+file   sessions/<SID>.<seat>.hw   {"seq":u64,"hash":Hex32,"sig":Hex64}   deny_unknown_fields
+sig    Ed25519(sk_seat, "0sum/v2/hw\0" ‖ lp(SID) ‖ h0 ‖ u64be(seq) ‖ hash), verify_strict
+```
+
+- **Check** in `play` and `register`, after replay, under the lock, before any duty:
+  - missing while the log has any entry authored by me → refuse
+  - unparsable, or the signature doesn't verify under my key → refuse
+  - `seq >= len(log)` or `log[seq].hash != hash` → refuse with
+    `ROLLBACK: you last saw seq <seq>:<12hex>; this log no longer contains it. Don't play on. Run 0sum verify.`
+  - refuse = exit 1, append nothing, write nothing.
+- **Write** atomically (tmp + rename, 0600), after the session save succeeds and still under
+  the lock, at the current head. Also on look-only runs, and at `register`.
+- Every password-holding invocation also prints the player's own last move in words and the
+  head, so a human notices a vanished move even without the mark:
+  `your last move: called liar on Alice's 3×6 (round 1, seq 10)` / `head 16:<12hex>`.
+  Protocol entries (commit, entropy, reveal) aren't moves; with no move yet it shows
+  `registered`.
+
+What it stops and what it doesn't is in §12.2 and §12.5. (A shell-memory `ZEROSUM_SEEN`
+wrapper and a `0sum head` command were considered and waived as over-build.)
+
 ---
 
 ## 7. CLI and the round flow
@@ -358,11 +411,16 @@ $XDG_CONFIG_HOME/0sum or ~/.0sum/        mode 0700
 ### 7.1 Commands
 
 ```
-0sum new <game> [--ruleset NAME]   prompts player count + names; prints SID + register commands
+0sum new <game> [--ruleset NAME]   prompts player count (2-8) + names; prints SID + register commands
 0sum register <SID> <name>         mints a password, appends register, runs duties if the game just started
 0sum play [MOVE...]                password from ZEROSUM_PASSWORD; duties, then moves; no moves = status
 0sum verify <SID>                  public, no password; full replay; prints narrative + head or BROKEN
 ```
+
+`new` refuses, before creating anything, a roster whose names collide case-insensitively
+(A2: `register` matches names case-insensitively, so `Alice`/`alice` would leave a seat
+unclaimable forever) or don't match the §3.4 name pattern (A6). `register` and `play` print
+`your last move: …` and `head <seq>:<12hex>` on every run (§6.1).
 
 Game ids: `farkle`, plus `liars-dice` (aliases `liarsdice`, `ld`). Liar's Dice moves:
 `bid <qty> <face>` (alias `b`), `liar` (aliases `l`, `call`), `spot` (alias `exact`; only if
@@ -390,17 +448,17 @@ so the dice below are the real derived values.
 | # | Who runs | Command | Entries appended (seq · author · body) | Prints |
 |---|---|---|---|---|
 | 1 | anyone | `0sum new ld` (Alice, Bob) | `0 · — · genesis` | SID, register lines |
-| 2 | Alice | `0sum register TEST01 Alice` | `1 · p1 · register` | password, `read -rs` hint, waiting on Bob |
+| 2 | Alice | `0sum register TEST01 Alice` | `1 · p1 · register` | password, `read -rs ZP; zs() …` hint, waiting on Bob |
 | 3 | Bob | `0sum register TEST01 Bob` | `2 · p2 · register` → game started → duty: `3 · p2 · commit{1}` | password; waiting on Alice to roll |
-| 4 | Alice | `0sum play` | duties: `4 · p1 · commit{1}`, `5 · p1 · entropy{1}` (all committed) | rolled; waiting on Bob's roll |
-| 5 | Bob | `0sum play` | duty: `6 · p2 · entropy{1}` → phase Bidding, Alice starts | **your dice: 2 3 4 5 5**; Alice bids first |
-| 6 | Alice | `0sum play` | — | **your dice: 1 2 5 6 6**; your bid |
-| 7 | Alice | `0sum play bid 2 6` | `7 · p1 · bid{2,6}` | |
-| 8 | Bob | `0sum play bid 3 5` | `8 · p2 · bid{3,5}` | |
-| 9 | Alice | `0sum play bid 3 6` | `9 · p1 · bid{3,6}` | |
-| 10 | Bob | `0sum play liar` | `10 · p2 · call{liar}`, then duties `11 · p2 · reveal{1}`, `12 · p2 · commit{2}` | waiting on Alice's reveal |
-| 11 | Alice | `0sum play` | duty `13 · p1 · reveal{1}` → **resolves**: sixes = 6,6 + wild 1 = 3 ≥ 3, so caller Bob loses a die (4 left); round 2, starter Bob. Duties: `14 · p1 · commit{2}`, `15 · p1 · entropy{2}` | round result with all dice; waiting on Bob's roll |
-| 12 | Bob | `0sum play` | duty `16 · p2 · entropy{2}` → Bidding, Bob starts | round 1 result; **your dice** (4); you bid first |
+| 4 | Alice | `zs play` | duties: `4 · p1 · commit{1}`, `5 · p1 · entropy{1}` (all committed) | rolled; waiting on Bob's roll |
+| 5 | Bob | `zs play` | duty: `6 · p2 · entropy{1}` → phase Bidding, Alice starts | **your dice: 1 1 4 4 5**; Alice bids first |
+| 6 | Alice | `zs play` | — | **your dice: 1 3 4 4 4**; your bid |
+| 7 | Alice | `zs play bid 2 6` | `7 · p1 · bid{2,6}` | |
+| 8 | Bob | `zs play bid 3 5` | `8 · p2 · bid{3,5}` | |
+| 9 | Alice | `zs play bid 3 6` | `9 · p1 · bid{3,6}` | |
+| 10 | Bob | `zs play liar` | `10 · p2 · call{liar}`, then duties `11 · p2 · reveal{1}`, `12 · p2 · commit{2}` | waiting on Alice's reveal |
+| 11 | Alice | `zs play` | duty `13 · p1 · reveal{1}` → **resolves**: no 6s showing, but wild 1s (Alice's one + Bob's two) = 3 ≥ 3, so caller Bob loses a die (4 left); round 2, starter Bob. Duties: `14 · p1 · commit{2}`, `15 · p1 · entropy{2}` | round result with all dice; waiting on Bob's roll |
+| 12 | Bob | `zs play` | duty `16 · p2 · entropy{2}` → Bidding, Bob starts | round 1 result; **your dice** (4); you bid first |
 
 Steps 6 and 11 are "look" invocations. Each player always needs one invocation after the
 last entropy they depend on before they can see dice. That's the information-theoretic floor
@@ -431,7 +489,7 @@ for asynchronous play without a co-signer running in the background.
       "hash": "2c0830ef6065e388e48a5db116d0acd630386b8d6c936612070ddc4eb128cd2c",
       "sig": "7e9f9f475e42da3e8a3724967ce7c540d8025bae70c4eada55b7a6196e44449d882b39b8fdfbe44119220aa01105fec20a4e8e0a229684dbbb44116fd28bf201" },
     { "seq": 3, "author": "p2", "body": { "game": { "commit":  { "round": 1, "c": "9dddb0…72dd" } } }, "…": "…" },
-    { "seq": 5, "author": "p1", "body": { "game": { "entropy": { "round": 1, "n": "040563…b4a6" } } }, "…": "…" },
+    { "seq": 5, "author": "p1", "body": { "game": { "entropy": { "round": 1, "n": "4b5815…5d7c" } } }, "…": "…" },
     { "seq": 7, "author": "p1", "body": { "game": { "bid":     { "qty": 2, "face": 6 } } }, "…": "…" },
     { "seq": 10,"author": "p2", "body": { "game": { "call":    { "kind": "liar" } } }, "…": "…" },
     { "seq": 11,"author": "p2", "body": { "game": { "reveal":  { "round": 1, "s": "24480e…ad9e" } } }, "…": "…" }
@@ -462,7 +520,8 @@ src/main.rs               CLI + registry (dispatch)
 src/engine/mod.rs         Game trait, Ctx, Table<G>, replay, append, apply_chain
 src/engine/log.rs         Entry/Body/Genesis/Register, Hex newtypes, canonical, h(), sign/verify
 src/engine/keys.rs        Password (gen/parse), Secrets (HKDF), signing key
-src/storage.rs            paths, modes, lock, atomic write, legacy cleanup
+src/engine/hw.rs          the seat-signed high-water mark (§6.1, A4)
+src/storage.rs            paths, modes, lock, atomic write, hw files, legacy-index warning
 src/farkle/mod.rs         impl Game for Farkle          (was game.rs + the Farkle half of session.rs)
 src/farkle/ruleset.rs     unchanged content             (git mv)
 src/farkle/scoring.rs     unchanged content             (git mv)
@@ -479,12 +538,13 @@ Games are zero-sized types with associated functions. No `&self`, no trait objec
 pub trait Game: 'static {
     const ID: &'static str;
     const DEFAULT_RULESET: &'static str;
-    type Rules: Serialize + DeserializeOwned + Clone;
+    type Rules: Serialize + DeserializeOwned + Clone + PartialEq;   // PartialEq for A7
     type State: Clone;
     type Move: Clone + Debug + PartialEq;
     type Event: Serialize + DeserializeOwned + Clone + Debug;   // #[serde(deny_unknown_fields)]
 
     fn ruleset(name: &str) -> Result<Self::Rules, String>;
+    fn rules_name(rules: &Self::Rules) -> &str;                  // A7: compare with ruleset(name)
     fn describe(rules: &Self::Rules) -> String;                  // one line for new/register output
     fn initial(rules: Self::Rules, info: &SessionInfo) -> Self::State; // info = { session_id, seats }
     fn parse_moves(tokens: &[String]) -> Result<Vec<Self::Move>, String>;
@@ -503,9 +563,14 @@ pub trait Game: 'static {
     fn to_move(state: &Self::State) -> Option<usize>;   // None = nobody (protocol wait / game over)
     fn winner(state: &Self::State) -> Option<usize>;
 
+    fn waiting(state: &Self::State, names: &[String]) -> String;  // "Bob's roll", for apply_chain
     fn narrate(before: &Self::State, author: usize, ev: &Self::Event, after: &Self::State,
                names: &[String]) -> Vec<String>;
     fn render(state: &Self::State, names: &[String], me: Option<usize>, ctx: Option<&Ctx>) -> String;
+
+    /// A4's `your last move:` text for the author's own event; None = protocol entry.
+    fn recap(before: &Self::State, ev: &Self::Event, names: &[String]) -> Option<String>;
+    fn moment(before: &Self::State) -> Option<String> { None }   // e.g. "round 2"
 }
 
 pub struct Ctx { pub secrets: Secrets, pub rng: StdRng }
@@ -531,6 +596,7 @@ ever flow into producing events and rendering, never into validating them.** Tie
 pub struct Table<G: Game> {
     pub session_id: String, pub names: Vec<String>, pub seats: Vec<String>,
     pub keys: Vec<Option<VerifyingKey>>, pub state: G::State, pub head: [u8; 32],
+    pub last_move: Vec<Option<(u64, String)>>,   // per seat, for `your last move:` (A4)
 }
 impl<G: Game> Table<G> { pub fn started(&self) -> bool { self.keys.iter().all(Option::is_some) } }
 
@@ -563,8 +629,9 @@ for mv in moves:
 
 The legal prefix persists. A turn-ending move halts the chain via the `to_move` check, and a
 win halts via the `winner` check. `cmd_play` becomes: lock → load → replay → resolve seat
-from pubkey → `apply_chain` → save if anything was appended → print `narrate` for each step,
-then `render`. **#8 falls out naturally.** Its tests (seeded `StdRng`, fixed-password
+from pubkey → check the high-water mark (§6.1) → `apply_chain` → save if anything was
+appended → write the mark → print `narrate` for each step, then `render`, then
+`your last move:` and the head. **#8 falls out naturally.** Its tests (seeded `StdRng`, fixed-password
 `Secrets`, an in-memory `Session`) need no filesystem.
 
 ### 9.5 Registry
@@ -594,7 +661,7 @@ a plugin system.
 
 Farkle adopts the whole envelope. It's shared machinery, and it gets G2 (no forging or editing
 of the other player's moves) plus G6 (no illegal keeps or banks) for free. Gameplay and output
-are unchanged apart from the password hint lines, which become `0sum play roll`, and `0sum play`
+are unchanged apart from the password hint lines, which become `zs play roll` (A5), and `0sum play`
 with no move, which now shows status instead of erroring.
 
 **It does not make Farkle's dice fair.** The roller writes `rolled{dice}`, so a roller who edits
@@ -702,7 +769,7 @@ pub struct State {
 | `entropy{k,n}` | `Rolling`, `k==round`, `a` live, `entropy[a]` empty, **every live seat has `commits` set** | store; if every live seat has entropy → `Bidding`, `turn = starter` |
 | `bid{q,f}` | `Bidding`, `a == turn`, legal and beats the last bid | push; `turn = next_live(a)` |
 | `call{kind}` | `Bidding`, `bids` non-empty, `a == turn`, `kind==Spot ⇒ rules.spot_on` | `call = (a, kind)`; `Revealing` |
-| `reveal{k,s}` | `Revealing`, `k==round`, `a` live, `revealed[a]` empty, `C(sid,k,seat_a,s) == commits[a]` | `revealed[a] = derive(...)`; if every live seat revealed → resolve |
+| `reveal{k,s}` | `Revealing`, `k==round`, `a` live, `revealed[a]` empty, `C(sid,k,seat_a,s) == commits[a]`, `entropy[a] == n(sid,k,seat_a,s,CSET)` (A3) | `revealed[a] = derive(...)`; if every live seat revealed → resolve |
 
 **Resolve:**
 1. Compute the count, then the loser (§10.1). `dice[loser] -= 1`. Record `last`.
@@ -745,14 +812,21 @@ suggested BLAKE3 keeps everything in one hash family that's already in the tree.
 Said plainly, so nobody overclaims:
 
 1. **Deleting or resetting** the session file or `~/.0sum/`. You get detection only by noticing it's gone.
-2. **Truncation / rollback.** Every prefix of a valid log is itself a valid log. A player can cut
-   the file back to an earlier point, and nothing in the file can prove it. **Concrete exploit:**
-   after the reveals, Alice knows Bob's dice. She truncates back to before her own last bid and
-   bids again with full knowledge. Bob finds out only if he notices his call or the round is
-   gone. Mitigation is out-of-band: every invocation prints `head <seq>:<12 hex>`, and `verify`
-   prints the whole history. Once logs cross machines (the remote phase), a rollback-and-replay
-   becomes **provable**, because the cheater will have signed two different children of the
-   same `prev` (equivocation).
+2. **Truncation / rollback (A4).** Every prefix of a valid log is itself a valid log, so nothing
+   in the log can prove it was cut back. **Concrete exploit, the harvest:** Bob snapshots, calls
+   liar, waits for Alice's next invocation to reveal her dice automatically, then restores the
+   snapshot. Now he knows her dice and the call never happened, so he bids instead.
+   **What the high-water mark (§6.1) does:** each seat's binary remembers, under its own
+   signature, the last head it saw, and refuses a log that no longer contains it. That stops
+   every **unplanned** rollback: truncating the log after the fact, or restoring only the log.
+   **What it doesn't do:** players share a uid and a disk. A cheater who **plans** it and
+   snapshots the **whole directory** (log and every seat's mark) before calling restores a
+   consistent world: Alice's mark is old again, and her binary can't tell. The remaining
+   defences are human and out-of-band: every run prints `your last move: …` and
+   `head <seq>:<12hex>` (a move that vanished, or a head that went backwards, is visible), and
+   `verify` prints the whole history. Once logs cross machines (the remote phase), a
+   rollback-and-replay becomes **provable**, because the cheater will have signed two different
+   children of the same `prev` (equivocation).
 3. **Stalling.** Refusing to commit, publish entropy, reveal, or move. There's no trusted clock,
    so there are no timeouts. The log shows exactly who owes what (`waiting on Alice's reveal`),
    so the stall is attributable, never ambiguous.
@@ -760,21 +834,36 @@ Said plainly, so nobody overclaims:
    history, your environment (`/proc/<pid>/environ`), your terminal scrollback, and an agent's
    transcripts. Anyone who reads your password **is** you. The design keeps the password off
    disk and off the command line, and that is all a program can do.
-5. **Modified binary + undetected rollback** gives a random *re-draw* of your own Liar's Dice dice
-   (§4.2). Not a choice, and it needs the opponent to re-run without noticing.
+5. **Modified binary + planned rollback: best-of-k re-draws (A4).** With a modified binary that
+   commits a fresh secret instead of the derived one, a cheater can snapshot the whole directory
+   before committing, look at the dice that come out, and restore and retry until they like
+   them. Each retry is a random re-draw, never a choice (§4.2), but keeping the best of `k` is
+   a real edge. It needs a planned full-directory snapshot (an unplanned rollback trips the
+   opponent's mark) and an opponent who re-runs each time without noticing the head moving
+   backwards. Commits, entropy and reveals aren't moves, so `your last move` won't show it;
+   only the head will.
 6. **Farkle roll honesty** (§9.6). The roller can sign dice of their choosing.
 7. **Genesis before the first registration** is unsigned. `register` prints the game, ruleset and
    roster it's about to sign over, and registering means consenting to exactly that. After the
    first `register`, genesis is locked.
 8. **Collusion and table talk** in N > 2 games. Inherent to the game.
 9. **Timestamps** are self-reported and display-only.
+10. **The binary itself (A9).** A same-uid opponent can replace the `0sum` on your `PATH`, or hook
+    your `~/.zshrc`, and then every guarantee above is whatever their binary says it is. That is
+    the real ceiling of this design on a shared account. Nothing in a program can fix it.
+11. **Seat squatting (A9).** Anyone can run `0sum register <SID> Bob` before Bob does. It fails
+    loudly for Bob (`` `Bob` has already registered ``), never silently: re-create the session.
+12. **Duplicate JSON keys (A9)** inside a `game` body collapse to the last value before hashing,
+    so the raw file can show a key the log doesn't mean. Read `0sum verify`, not the raw file.
 
 ---
 
 ## 13. Tests and golden vectors
 
 These vectors come from `ed25519-dalek 2.2`, `sha2 0.10`, `hkdf 0.12`, `serde_json 1`,
-following §2/§3/§4 exactly. Put them in tests as literals.
+following §2/§3/§4 exactly. Put them in tests as literals. The `n` and `dice` lines were
+regenerated for A3 and cross-checked by an independent Python-stdlib implementation written
+from this text (`tests/vectors/ld_vectors.py`, a dev script CI doesn't run).
 
 ```
 SID = TEST01, round r = 1
@@ -783,15 +872,15 @@ p1 password TEST01-AAAAAAAAAAAAAAAAAAAAAAAAAA
   pubkey    c14f1c546e873389fc5442bc5379bae199b5a514b6cdea5e4a5914ca01d28178
   s[1]      612f661662e64504ef80d2ce7dcb3171d12fb3a73733e272eab3a79a18a6efb3
   C[1]      d7f50e01f67658bface606486dff390228e09589e4ae46f60295ba7c6a196128
-  n[1]      040563f999e0bfad9b4426d3755008fece7ebe75829da2474745ce1bc0fab4a6
-  dice[1]   [5, 6, 2, 1, 6]            (5 dice; others = [n_p2])
+  n[1]      4b5815a8afe6b4db7eda09da30246c1cc116dc66476f6b11345420c3dd265d7c
+  dice[1]   [4, 3, 4, 1, 4]            (5 dice; others = [n_p2])
 p2 password TEST01-BBBBBBBBBBBBBBBBBBBBBBBBBB
   sign_seed edab3f381eaa898c8d2b40af741b7313bb5712b428dc05a5f1a32b2e047284e0
   pubkey    53186d38e72218ba73d8db682147897eb029c4d298bfdf56e4a5ef3c8206f2e7
   s[1]      24480e09e67297d9b0c2cf278727d3df6c636c2d122d01a7ed6f47421bd8ad9e
   C[1]      9dddb09c7c16cc8a2cba8b6db9ec56469d97580477b6da97f264d93f4b1c72dd
-  n[1]      d009b4d74f630cd494d7b54cd1b6abae43368b26741af5821f4eac2333f14f32
-  dice[1]   [3, 5, 2, 4, 5]            (others = [n_p1])
+  n[1]      7470013c07f5eaf7d2f31f1d2331afb684ee7f4120695e27c4a4264fb7eb5797
+  dice[1]   [5, 4, 1, 4, 1]            (others = [n_p1])
 CSET[1]     2998cfcb2d78a9012bdcc6a131d8a4bf04e11939cfc0f7b8d89806e4582614f0
 
 genesis (§8, ts 0, nonce zeros) canonical bytes:
@@ -813,8 +902,10 @@ Required tests (beyond the vectors):
   - adding an unknown field → parse failure
   - editing genesis `ruleset` after a register → `prev` mismatch on seq 1
 - **Ordering:** an `entropy{r}` placed before the last live `commit{r}` (with valid signatures) → `fold` rejects.
-- **Reveal:** a wrong `s` → rejected. Round resolution with the vector dice → `3×6` is true,
-  caller loses, `dice == [5, 4]`, round 2 starter `p2`.
+- **Reveal:** a wrong `s` → rejected. Round resolution with the vector dice → `3×6` is true
+  (no 6s, three wild 1s), caller loses, `dice == [5, 4]`, round 2 starter `p2`.
+- **Forged entropy (A3):** an `entropy{r}` that isn't `n(s, CSET)` folds, but that seat's
+  reveal is rejected with `entropy for round <r> doesn't match the revealed secret`.
 - **Determinism:** run duties twice from the same truncated prefix and get byte-identical
   commit/entropy entries (rollback can't re-roll).
 - **Rules:** a bid-ordering table (including the `wild_ones` face range and the qty cap);
@@ -825,17 +916,26 @@ Required tests (beyond the vectors):
   - LD: duties run when called with no moves; `bid` during `Rolling` → "waiting on …".
 - **All existing Farkle tests** pass after the move. `plays_a_full_game_to_a_win` runs through
   `apply_chain` + `replay`, and the final `replay` equals the live state.
-- **Storage:** after any write, modes are 0700 dirs and 0600 file; legacy `index.json` is removed;
-  a v1 file is refused with the message.
+- **Storage:** after any write, modes are 0700 dirs and 0600 file; a legacy `index.json`
+  survives a v2 run untouched and the warning prints (A1); a v1 file is refused with the message.
+- **Rollback (A4):** truncate a log after a reveal; the other seat's next run refuses with
+  `ROLLBACK`, exits 1, and writes nothing (session and mark files byte-identical). Missing,
+  unparsable and foreign-signed marks are refused.
+- **Genesis (A2, A6, A7):** `new` rejects case-insensitive duplicate names and names outside the
+  pattern; verify rejects a doctored name (and prints it inert), a ruleset that differs from its
+  built-in, and rosters outside 2..=8.
 
 ---
 
 ## 14. Build order and what's out of scope
 
 **PR 1, the engine (no new game):** `engine/{log,keys}`, storage, the trait, Farkle moved
-onto it, `verify`, the env-var password, index deletion. Closes #6 and #8. All Farkle tests green.
+onto it, `verify`, the env-var password, the legacy-index warning (A1). Closes #6 and #8. All
+Farkle tests green.
 
-**PR 2, Liar's Dice:** `liars_dice/{ruleset,dice,mod}`, the vectors, the tamper and rules suites.
+**PR 2, Liar's Dice:** `liars_dice/{ruleset,dice,mod}`, the vectors, the tamper and rules suites,
+plus amendments A3–A9 (verifiable entropy, the high-water mark, the `zs` wrapper, name and
+ruleset checks, terminal-safe output).
 
 **Out of scope, deliberately:**
 - `0sum watch`, a background co-signer loop that auto-runs duties. It's the big UX win for
@@ -845,5 +945,5 @@ onto it, `verify`, the env-var password, index deletion. Closes #6 and #8. All F
 - Remote transport.
 - Tier-3 mental poker.
 
-Update the README CLI examples to `export ZEROSUM_PASSWORD` + `0sum play …`, and add a pointer
-from DESIGN.md to this file. DESIGN.md otherwise stays as the phase-1 record.
+Update the README CLI examples to the `zs` wrapper (A5: `read -rs ZP; zs() { … }`, then
+`zs play …`; never `export`), and add a pointer from DESIGN.md to this file. DESIGN.md otherwise stays as the phase-1 record.
