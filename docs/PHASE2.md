@@ -832,7 +832,7 @@ Said plainly, so nobody overclaims:
    **What the high-water mark (§6.1) does:** each seat's binary remembers, under its own
    signature, the last head it saw, and refuses a log that no longer contains it. That stops
    every **unplanned** rollback: truncating the log after the fact, or restoring only the log.
-   This holds because the mark always gets written once the log is saved: `play` writes it
+   This holds because a mark write after the save never fails silently: `play` writes it
    before any duty (and refuses if it can't), the temp name is random so nothing planted can
    block the rename, and a failed write after the save is reported only after the head and
    the round are printed, never instead of them (§6.1, H1).
