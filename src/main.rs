@@ -1,26 +1,26 @@
-//! `0sum` — provably-fair CLI games. Phase 1: hotseat 2-player Farkle.
-//!
-//! No crypto yet (issue #1's tamper-evident core is a later chunk). State is a
-//! plain JSON session file shaped as an append-only move log; score and turn
-//! are projections over it (see [`session`]). Rules are swappable configs
-//! decoupled from mechanics (see [`ruleset`] / [`game`], issue #2).
+//! `0sum` — provably-fair CLI games. Every session is a signed, hash-chained
+//! log (docs/PHASE2.md); state is a replay of it through the game's `fold`.
+//! This file is the CLI plus the registry: one `match` from game id to engine.
 
-mod game;
-mod ruleset;
-mod scoring;
-mod session;
+mod engine;
+mod farkle;
 mod storage;
 
 use std::io::{self, Write};
+use std::marker::PhantomData;
 
 use clap::{Parser, Subcommand};
-use rand::rngs::StdRng;
-use rand::SeedableRng;
+use rand::rngs::{OsRng, StdRng};
+use rand::{RngCore, SeedableRng};
 
-use game::{Farkle, Game};
-use ruleset::RuleSet;
-use session::{GameState, Payload, Phase, RosterEntry, Session};
-use storage::IndexEntry;
+use engine::keys::{self, Password, Secrets};
+use engine::log::Session;
+use engine::{
+    append_register, apply_chain, genesis_game, head_line, new_session, replay, replay_narrated,
+    Broken, Chain, Ctx, Game, Table,
+};
+use farkle::Farkle;
+use storage::{LoadError, Store};
 
 #[derive(Parser)]
 #[command(
@@ -39,280 +39,278 @@ enum Command {
     New {
         /// Which game (currently: farkle).
         game: String,
-        /// Ruleset variant.
-        #[arg(long, default_value = "kcd")]
-        ruleset: String,
+        /// Ruleset variant (farkle: kcd [default], classic).
+        #[arg(long)]
+        ruleset: Option<String>,
     },
     /// Claim a seat by name in a session, print that player's password.
     Register { session_id: String, name: String },
-    /// Make a move: `roll`, `keep <dice...>`, or `bank`. Moves chain:
-    /// `keep 5 5 roll`.
+    /// Play with the password in ZEROSUM_PASSWORD. No moves = show status.
+    /// Farkle: `roll`, `keep <dice...>`, `bank`; moves chain: `keep 5 5 roll`.
     Play {
-        password: String,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        r#move: Vec<String>,
+        moves: Vec<String>,
     },
+    /// Replay and check a session's whole signed log. No password needed.
+    Verify { session_id: String },
 }
+
+const PASSWORD_ENV: &str = "ZEROSUM_PASSWORD";
+const LOAD_HINT: &str = "read -rs ZEROSUM_PASSWORD && export ZEROSUM_PASSWORD";
 
 fn main() {
     let cli = Cli::parse();
-    let result = match cli.command {
-        Command::New { game, ruleset } => cmd_new(&game, &ruleset),
-        Command::Register { session_id, name } => cmd_register(&session_id, &name),
-        Command::Play { password, r#move } => cmd_play(&password, &r#move),
-    };
+    let store = Store::from_env();
+    if let Some(w) = store.legacy_index_warning() {
+        eprintln!("{w}");
+    }
+    let result = store.prepare().and_then(|()| match cli.command {
+        Command::New { game, ruleset } => driver(&game)?.create(&store, ruleset.as_deref()),
+        Command::Register { session_id, name } => cmd_register(&store, &session_id, &name),
+        Command::Play { moves } => cmd_play(&store, &moves),
+        Command::Verify { session_id } => cmd_verify(&store, &session_id),
+    });
     if let Err(e) = result {
         eprintln!("error: {e}");
         std::process::exit(1);
     }
 }
 
-fn cmd_new(game: &str, ruleset_name: &str) -> Result<(), String> {
-    if !game.eq_ignore_ascii_case("farkle") {
-        return Err(format!("unknown game `{game}` (only `farkle` for now)"));
-    }
-    let ruleset = RuleSet::by_name(ruleset_name)?;
+trait Driver {
+    fn create(&self, store: &Store, ruleset: Option<&str>) -> Result<(), String>;
+    fn register(&self, store: &Store, s: Session, name: &str) -> Result<(), String>;
+    fn play(
+        &self,
+        store: &Store,
+        s: Session,
+        pw: &Password,
+        tokens: &[String],
+    ) -> Result<(), String>;
+    fn verify(&self, s: &Session) -> Result<(), String>;
+}
 
-    let count = prompt_usize("How many players? [2]: ", 2)?;
-    if count < 2 {
-        return Err("need at least 2 players".into());
-    }
+struct Engine<G>(PhantomData<G>);
 
-    let mut roster = Vec::new();
-    for i in 1..=count {
-        let name = prompt_line(&format!("Player {i} name: "))?;
-        let name = if name.trim().is_empty() {
-            format!("Player {i}")
-        } else {
-            name.trim().to_string()
-        };
-        roster.push(RosterEntry {
-            player_id: format!("p{i}"),
-            name,
-        });
+fn driver(game: &str) -> Result<&'static dyn Driver, String> {
+    match game.to_ascii_lowercase().as_str() {
+        "farkle" => Ok(&Engine::<Farkle>(PhantomData)),
+        other => Err(format!("unknown game `{other}` (available: farkle)")),
     }
+}
 
-    let session_id = storage::gen_session_id();
-    let genesis = Payload::SessionCreated {
-        game: "farkle".into(),
-        ruleset: ruleset.clone(),
-        roster: roster.clone(),
+fn load(store: &Store, sid: &str) -> Result<Session, String> {
+    store.load(sid).map_err(|e| e.message().to_string())
+}
+
+fn refuse_broken(sid: &str, b: Broken) -> String {
+    format!("session {sid} is {b} — refusing to append (see `0sum verify {sid}`)")
+}
+
+fn session_driver(s: &Session) -> Result<&'static dyn Driver, String> {
+    let game = genesis_game(s).map_err(|b| refuse_broken(&s.session_id, b))?;
+    driver(game)
+}
+
+fn cmd_register(store: &Store, sid: &str, name: &str) -> Result<(), String> {
+    let sid = keys::parse_sid(sid)?;
+    let _lock = store.lock(&sid)?;
+    let s = load(store, &sid)?;
+    session_driver(&s)?.register(store, s, name)
+}
+
+fn cmd_play(store: &Store, tokens: &[String]) -> Result<(), String> {
+    if tokens.first().is_some_and(|t| keys::looks_like_password(t)) {
+        return Err("don't put your password on the command line — it's in your shell history now; use ZEROSUM_PASSWORD".into());
+    }
+    let raw = std::env::var(PASSWORD_ENV)
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .ok_or_else(|| format!("set {PASSWORD_ENV} ({LOAD_HINT})"))?;
+    let pw = Password::parse(&raw)?;
+    let _lock = store.lock(pw.sid())?;
+    let s = load(store, pw.sid())?;
+    session_driver(&s)?.play(store, s, &pw, tokens)
+}
+
+/// Public and read-only: prints the narrative, then `OK …` or `BROKEN …` (exit 1).
+fn cmd_verify(store: &Store, sid: &str) -> Result<(), String> {
+    let sid = keys::parse_sid(sid)?;
+    let s = match store.load(&sid) {
+        Ok(s) => s,
+        Err(LoadError::Corrupt(m)) => fail_verify(&format!("BROKEN: {m}")),
+        Err(e) => return Err(e.message().to_string()),
     };
-    let session = Session::new(session_id.clone(), genesis);
-    storage::save_session(&session)?;
-
-    println!();
-    println!(
-        "Created Farkle session (ruleset: {}, target: {})",
-        ruleset.name, ruleset.target_score
-    );
-    println!("  SESSION ID:  {session_id}");
-    println!();
-    println!("Each player claims their seat to get a password:");
-    for r in &roster {
-        println!("  0sum register {session_id} {}", shell_quote(&r.name));
+    let checked = genesis_game(&s)
+        .map_err(|b| b.to_string())
+        .and_then(|g| driver(g).map_err(|e| Broken { seq: 0, reason: e }.to_string()))
+        .and_then(|d| d.verify(&s));
+    match checked {
+        Ok(()) => Ok(()),
+        Err(e) => fail_verify(&e),
     }
-    Ok(())
 }
 
-fn cmd_register(session_id: &str, name: &str) -> Result<(), String> {
-    let mut session = storage::load_session(session_id)?;
-    let state = session.project();
+fn fail_verify(line: &str) -> ! {
+    println!("{line}");
+    std::process::exit(1)
+}
 
-    let seat = state
-        .roster
-        .iter()
-        .find(|r| r.name.eq_ignore_ascii_case(name))
-        .ok_or_else(|| format!("no player named `{name}` in session {session_id}"))?
-        .clone();
+fn ctx_for(pw: &Password) -> Ctx {
+    Ctx {
+        secrets: Secrets::from_password(pw),
+        rng: StdRng::from_entropy(),
+    }
+}
 
-    if state.registered.contains(&seat.player_id) {
-        return Err(format!("`{}` has already registered", seat.name));
+fn print_steps<G: Game>(chain: &Chain<G>, names: &[String]) {
+    for step in &chain.steps {
+        for line in G::narrate(&step.before, step.author, &step.event, &step.after, names) {
+            println!("{line}");
+        }
+    }
+}
+
+fn print_status<G: Game>(s: &Session, t: &Table<G>, me: usize, ctx: &Ctx) {
+    println!();
+    println!("{}", G::render(&t.state, &t.names, Some(me), Some(ctx)));
+    println!("{}", head_line(s));
+}
+
+impl<G: Game> Driver for Engine<G> {
+    fn create(&self, store: &Store, ruleset: Option<&str>) -> Result<(), String> {
+        let rules = G::ruleset(ruleset.unwrap_or(G::DEFAULT_RULESET))?;
+        let count = prompt_usize("How many players? [2]: ", 2)?;
+        if count < 2 {
+            return Err("need at least 2 players".into());
+        }
+        let mut names = Vec::new();
+        for i in 1..=count {
+            let name = prompt_line(&format!("Player {i} name: "))?;
+            names.push(match name.trim() {
+                "" => format!("Player {i}"),
+                n => n.to_string(),
+            });
+        }
+        let s = loop {
+            let mut nonce = [0u8; 16];
+            OsRng.fill_bytes(&mut nonce);
+            let sid = keys::random_crockford(keys::SID_LEN);
+            let s = new_session::<G>(&sid, &rules, &names, nonce)?;
+            if store.create(&s)? {
+                break s;
+            }
+        };
+        let sid = &s.session_id;
+        println!();
+        println!("Created {}", G::describe(&rules));
+        println!("  SESSION ID:  {sid}");
+        println!();
+        println!("Each player claims their seat to get a password:");
+        for n in &names {
+            println!("  0sum register {sid} {}", shell_quote(n));
+        }
+        Ok(())
     }
 
-    let password = storage::gen_password();
-    session.append(
-        Some(seat.player_id.clone()),
-        Payload::PlayerRegistered {
-            player_id: seat.player_id.clone(),
-        },
-    );
-    storage::save_session(&session)?;
-    storage::add_password(
-        &password,
-        IndexEntry {
-            session_id: session_id.to_string(),
-            player_id: seat.player_id.clone(),
-        },
-    )?;
-
-    let state = session.project();
-    println!();
-    println!("Registered {} in session {session_id}.", seat.name);
-    println!("  PASSWORD (keep secret):  {password}");
-    println!();
-    if state.started {
-        let first = state.current_player();
-        if first.player_id == seat.player_id {
-            println!("All players in. You play first:");
-            println!("  0sum play {password} roll");
-        } else {
-            // Never caption someone else's turn with this password — it would
-            // print a command that leaks the secret and cannot work.
-            println!("All players in. {} plays first:", first.name);
-            println!("  0sum play <{}'s password> roll", first.name);
-        }
-    } else {
-        let waiting: Vec<&str> = state
-            .roster
+    fn register(&self, store: &Store, mut s: Session, name: &str) -> Result<(), String> {
+        let sid = s.session_id.clone();
+        let mut t = replay::<G>(&s).map_err(|b| refuse_broken(&sid, b))?;
+        let seat = t
+            .names
             .iter()
-            .filter(|r| !state.registered.contains(&r.player_id))
-            .map(|r| r.name.as_str())
-            .collect();
-        println!("Waiting on: {}", waiting.join(", "));
-    }
-    Ok(())
-}
-
-fn cmd_play(password: &str, move_tokens: &[String]) -> Result<(), String> {
-    let entry = storage::lookup_password(password).ok_or("unknown password (did you register?)")?;
-    let mut session = storage::load_session(&entry.session_id)?;
-    let state = session.project();
-
-    if let Some(winner) = &state.winner {
-        println!("Game over — {} won.", state.name_of(winner));
-        render(&state);
-        return Ok(());
-    }
-    if !state.started {
-        return Err("not everyone has registered yet".into());
-    }
-
-    let farkle = Farkle;
-    if state.game != farkle.id() {
-        return Err(format!("session is `{}`, not farkle", state.game));
-    }
-
-    let you = &entry.player_id;
-    let moves = farkle.parse_moves(move_tokens)?;
-    let mut rng = StdRng::from_entropy();
-    let entries_before = session.log.len();
-
-    // Chained moves are applied one at a time against freshly projected state,
-    // so a move that ends the turn (bust, bank, win) stops the rest of the chain
-    // instead of playing on someone else's turn.
-    let mut failure = None;
-    for mv in &moves {
-        let before = session.project();
-        if before.winner.is_some() {
-            // Only reachable mid-chain — an already-won game returns above. The
-            // win is still announced below; this reports the moves it swallowed.
-            failure = Some("the game is over".into());
-            break;
+            .position(|n| n.eq_ignore_ascii_case(name))
+            .ok_or_else(|| format!("no player named `{name}` in session {}", t.session_id))?;
+        if t.keys[seat].is_some() {
+            return Err(format!("`{}` has already registered", t.names[seat]));
         }
-        if &before.current_player().player_id != you {
-            failure = Some(format!(
-                "it's {}'s turn, not yours",
-                before.current_player().name
+        let pw = Password::generate(&t.session_id);
+        let mut ctx = ctx_for(&pw);
+        let sk = ctx.secrets.signing_key();
+        append_register(&mut s, &mut t, seat, &sk)?;
+        let chain = if t.started() {
+            apply_chain(&mut s, &mut t, seat, &[], &mut ctx, &sk)
+        } else {
+            Chain {
+                steps: Vec::new(),
+                failure: None,
+            }
+        };
+        store.save(&s)?;
+
+        println!();
+        println!(
+            "Registered {} in session {}, signing over: {}; seats: {}.",
+            t.names[seat],
+            t.session_id,
+            G::describe(&t.rules),
+            t.names.join(", ")
+        );
+        println!("  PASSWORD (keep secret):  {}", pw.expose());
+        println!();
+        println!("Load it into this terminal (paste it, then Enter):");
+        println!("  {LOAD_HINT}");
+        println!();
+        print_steps(&chain, &t.names);
+        if t.started() {
+            println!("All players in.");
+            print_status(&s, &t, seat, &ctx);
+        } else {
+            println!("Waiting on: {}", t.unregistered().join(", "));
+        }
+        chain.failure.map_or(Ok(()), Err)
+    }
+
+    fn play(
+        &self,
+        store: &Store,
+        mut s: Session,
+        pw: &Password,
+        tokens: &[String],
+    ) -> Result<(), String> {
+        let sid = s.session_id.clone();
+        let mut t = replay::<G>(&s).map_err(|b| refuse_broken(&sid, b))?;
+        let mut ctx = ctx_for(pw);
+        let sk = ctx.secrets.signing_key();
+        let me = t.seat_of(&sk.verifying_key()).ok_or_else(|| {
+            format!(
+                "this password doesn't belong to any seat in session {}",
+                t.session_id
+            )
+        })?;
+        if !t.started() {
+            return Err(format!(
+                "not everyone has registered yet (waiting on: {})",
+                t.unregistered().join(", ")
             ));
-            break;
         }
-        let payloads = match farkle.apply(&before, mv, &mut rng) {
-            Ok(payloads) => payloads,
-            Err(e) => {
-                failure = Some(e);
-                break;
-            }
-        };
-        for p in &payloads {
-            session.append(Some(you.clone()), p.clone());
-        }
-        report(&before, &payloads, &session.project());
-    }
-
-    if session.log.len() > entries_before {
-        storage::save_session(&session)?;
-        let after = session.project();
-        println!();
-        render(&after);
-        println!();
-        if let Some(winner) = &after.winner {
-            println!(">>> {} WINS! <<<", after.name_of(winner));
+        let moves = if tokens.is_empty() {
+            Vec::new()
         } else {
-            println!("{}", next_hint(&after));
-        }
-    }
-
-    match failure {
-        Some(e) => Err(e),
-        None => Ok(()),
-    }
-}
-
-/// Narrate one applied move. `before` names the actor (banking and busting both
-/// hand the turn on, so `after` would credit the wrong player).
-fn report(before: &GameState, payloads: &[Payload], after: &GameState) {
-    let actor = before.current_player();
-    for p in payloads {
-        match p {
-            Payload::Rolled { dice } => println!("{} rolled: {}", actor.name, fmt_dice(dice)),
-            Payload::Kept { points, .. } => {
-                println!("Kept for {points} — turn total now {}.", after.turn_total)
-            }
-            Payload::Busted { .. } => {
-                println!("BUST! No scoring dice. {} loses this turn.", actor.name)
-            }
-            Payload::Banked { points } => println!(
-                "{} banked {points} — total {}.",
-                actor.name, after.totals[&actor.player_id]
-            ),
-            _ => {}
-        }
-    }
-}
-
-fn render(state: &GameState) {
-    println!("--- scores (target {}) ---", state.ruleset.target_score);
-    let current = state.winner.is_none();
-    for r in &state.roster {
-        let marker = if current && r.player_id == state.current_player().player_id {
-            "*"
-        } else {
-            " "
+            G::parse_moves(tokens)?
         };
-        println!("  {marker} {:<12} {}", r.name, state.totals[&r.player_id]);
-    }
-    if current {
-        if !state.table.is_empty() {
-            println!("  table: {}", fmt_dice(&state.table));
+        let before = s.log.len();
+        let chain = apply_chain(&mut s, &mut t, me, &moves, &mut ctx, &sk);
+        let appended = s.log.len() > before;
+        if appended {
+            store.save(&s)?;
         }
-        if state.turn_total > 0 {
-            println!("  this turn (unbanked): {}", state.turn_total);
+        print_steps(&chain, &t.names);
+        if appended || tokens.is_empty() {
+            print_status(&s, &t, me, &ctx);
         }
+        chain.failure.map_or(Ok(()), Err)
     }
-}
 
-fn next_hint(state: &GameState) -> String {
-    let name = &state.current_player().name;
-    match state.phase {
-        Phase::AwaitRoll => format!("{name}'s turn — roll: play <password> roll"),
-        Phase::AwaitKeep => format!(
-            "{name}: keep scoring dice from {}, e.g. play <password> keep <dice...>",
-            fmt_dice(&state.table)
-        ),
-        Phase::AwaitRollOrBank => format!(
-            "{name}: roll again ({} dice) or bank {} — play <password> roll | bank",
-            state.dice_available, state.turn_total
-        ),
-        Phase::GameOver => "game over".into(),
+    fn verify(&self, s: &Session) -> Result<(), String> {
+        let mut narrative = Vec::new();
+        let result = replay_narrated::<G>(s, &mut narrative);
+        for line in &narrative {
+            println!("{line}");
+        }
+        result.map_err(|b| b.to_string())?;
+        println!("OK  {} entries  {}", s.log.len(), head_line(s));
+        Ok(())
     }
-}
-
-fn fmt_dice(dice: &[u8]) -> String {
-    dice.iter()
-        .map(|d| d.to_string())
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 fn prompt_line(prompt: &str) -> Result<String, String> {

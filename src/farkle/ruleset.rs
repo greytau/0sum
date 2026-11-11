@@ -11,7 +11,8 @@ use serde::{Deserialize, Serialize};
 
 /// A full set of Farkle rules. Stored in the session genesis block so every
 /// session is self-describing and reproducible.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RuleSet {
     pub name: String,
     pub dice_count: u8,
