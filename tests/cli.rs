@@ -270,3 +270,131 @@ fn new_rejects_names_that_could_carry_escapes() {
     assert!(!err(&o).contains('\x1b'));
     assert!(sb.sessions().is_empty());
 }
+
+#[cfg(unix)]
+fn assert_private_and_clean(sb: &Sandbox) {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = |p: &PathBuf| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&sb.root()), 0o700);
+    assert_eq!(mode(&sb.root().join("sessions")), 0o700);
+    for e in fs::read_dir(sb.root().join("sessions")).unwrap() {
+        let p = e.unwrap().path();
+        assert_eq!(mode(&p), 0o600, "{}", p.display());
+        assert!(!p.to_string_lossy().ends_with(".tmp"), "{}", p.display());
+    }
+}
+
+/// A4, the cheater's own view too: Alice snapshots before her bid, learns
+/// Bob's dice from the reveals, and restores. Both seats' binaries refuse the
+/// restored log, with or without a move, and write nothing.
+#[test]
+fn a_rollback_after_reveal_stops_both_seats() {
+    let sb = Sandbox::new();
+    let (sid, alice, bob) = liars_dice_table(&sb);
+    sb.run(&["play"], "", Some(&alice)); // 4 commit, 5 entropy
+    sb.run(&["play"], "", Some(&bob)); // 6 entropy
+    let path = sb.root().join(format!("sessions/{sid}.json"));
+    let snapshot = fs::read_to_string(&path).unwrap();
+    sb.run(&["play", "bid", "1", "2"], "", Some(&alice)); // 7
+    sb.run(&["play", "liar"], "", Some(&bob)); // 8 call, 9 reveal, 10 commit
+    let o = sb.run(&["play"], "", Some(&alice)); // 11 reveal → resolve, 12, 13
+    assert!(out(&o).contains("Round 1 result: Bob called liar on Alice's 1×2."));
+    #[cfg(unix)]
+    assert_private_and_clean(&sb);
+
+    fs::write(&path, &snapshot).unwrap();
+    let marks = |who: &str| fs::read(sb.root().join(format!("sessions/{sid}.{who}.hw"))).unwrap();
+    let before = (marks("p1"), marks("p2"));
+    for (pw, seen) in [(&alice, 13), (&bob, 10)] {
+        for args in [&["play"][..], &["play", "bid", "2", "2"]] {
+            let o = sb.run(args, "", Some(pw));
+            assert_eq!(o.status.code(), Some(1));
+            assert!(
+                err(&o).contains(&format!("ROLLBACK: you last saw seq {seen}:")),
+                "{}",
+                err(&o)
+            );
+            assert_eq!(out(&o), "");
+        }
+    }
+    assert_eq!(fs::read_to_string(&path).unwrap(), snapshot);
+    assert_eq!((marks("p1"), marks("p2")), before);
+}
+
+/// Bob's key doesn't exist until he registers, so no mark for his seat can
+/// be his. A planted one stops registration loudly: no seat, no password.
+#[test]
+fn a_mark_planted_for_an_unregistered_seat_refuses_registration() {
+    let sb = Sandbox::new();
+    let o = sb.run(&["new", "ld"], "2\nAlice\nBob\n", None);
+    let sid = after(&out(&o), "SESSION ID:").to_string();
+    sb.run(&["register", &sid, "Alice"], "", None);
+    let dir = sb.root().join("sessions");
+    let path = dir.join(format!("{sid}.json"));
+    let log = fs::read_to_string(&path).unwrap();
+    let planted = dir.join(format!("{sid}.p2.hw"));
+    for mark in [
+        fs::read_to_string(dir.join(format!("{sid}.p1.hw"))).unwrap(),
+        "{}".into(),
+    ] {
+        fs::write(&planted, &mark).unwrap();
+        let o = sb.run(&["register", &sid, "Bob"], "", None);
+        assert_eq!(o.status.code(), Some(1));
+        assert!(err(&o).contains("high-water mark"), "{}", err(&o));
+        assert!(!out(&o).contains("PASSWORD"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), log);
+        assert_eq!(fs::read_to_string(&planted).unwrap(), mark);
+    }
+    fs::remove_file(&planted).unwrap();
+    let o = sb.run(&["register", &sid, "Bob"], "", None);
+    assert!(o.status.success(), "{}", err(&o));
+}
+
+#[test]
+fn registering_a_taken_seat_again_is_refused() {
+    let sb = Sandbox::new();
+    let (sid, _, bob) = liars_dice_table(&sb);
+    let path = sb.root().join(format!("sessions/{sid}.json"));
+    let log = fs::read_to_string(&path).unwrap();
+    let o = sb.run(&["register", &sid, "BOB"], "", None);
+    assert_eq!(o.status.code(), Some(1));
+    assert_eq!(err(&o).trim(), "error: `Bob` has already registered");
+    assert!(!out(&o).contains("PASSWORD"));
+    assert_eq!(fs::read_to_string(&path).unwrap(), log);
+    assert!(sb.run(&["play"], "", Some(&bob)).status.success());
+}
+
+/// A6 end to end: an unknown key smuggling escapes into the session file or
+/// a mark comes back out of `verify` and `play` as inert text.
+#[test]
+fn escapes_in_file_keys_reach_the_terminal_inert() {
+    let sb = Sandbox::new();
+    let (sid, alice, _) = liars_dice_table(&sb);
+    let path = sb.root().join(format!("sessions/{sid}.json"));
+    let good = fs::read_to_string(&path).unwrap();
+    let raw = |o: &Output| [&o.stdout[..], &o.stderr[..]].concat();
+    let evil = r#""\u001b]0;pwned\u0007\u202e": 1,"#;
+    fs::write(&path, good.replacen('{', &format!("{{{evil}"), 1)).unwrap();
+    for (args, pw) in [(&["verify", &sid][..], None), (&["play"][..], Some(&alice))] {
+        let o = sb.run(args, "", pw.map(|p| p.as_str()));
+        assert_eq!(o.status.code(), Some(1));
+        let text = String::from_utf8(raw(&o)).unwrap();
+        assert!(
+            text.contains(r"unknown field `\u{1b}]0;pwned\u{7}\u{202e}`"),
+            "{text}"
+        );
+        assert!(!text.contains(['\u{1b}', '\u{7}', '\u{202e}']), "{text}");
+    }
+    fs::write(&path, &good).unwrap();
+    let mark = sb.root().join(format!("sessions/{sid}.p1.hw"));
+    let m = fs::read_to_string(&mark).unwrap();
+    fs::write(&mark, m.replacen('{', &format!("{{{evil}"), 1)).unwrap();
+    let o = sb.run(&["play"], "", Some(&alice));
+    assert_eq!(o.status.code(), Some(1));
+    let text = String::from_utf8(raw(&o)).unwrap();
+    assert!(
+        text.contains("doesn't parse (unknown field `\\u{1b}]0;pwned"),
+        "{text}"
+    );
+    assert!(!text.contains(['\u{1b}', '\u{7}', '\u{202e}']), "{text}");
+}

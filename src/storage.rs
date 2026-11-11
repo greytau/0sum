@@ -319,6 +319,94 @@ mod tests {
         assert!(matches!(store.load("TEST02"), Err(LoadError::Corrupt(_))));
     }
 
+    /// A signed Liar's Dice log survives save → load byte for byte, and the
+    /// loaded copy replays to the same state and head.
+    #[test]
+    fn a_session_round_trips_through_save_and_load() {
+        use crate::engine::testkit::seated;
+        use crate::engine::{apply_chain, replay};
+        use crate::liars_dice::{ruleset::RuleSet as Ld, LiarsDice, Move};
+
+        let tmp = TempRoot::new();
+        let store = Store::at(tmp.0.clone());
+        store.prepare().unwrap();
+        let (mut s, mut t, mut players) = seated::<LiarsDice>(&Ld::classic(), &["Alice", "Bob"]);
+        assert!(store.create(&s).unwrap());
+        for (seat, moves) in [(0, vec![]), (1, vec![]), (0, vec![Move::Bid(2, 6)])] {
+            let p = &mut players[seat];
+            assert_eq!(
+                apply_chain(&mut s, &mut t, seat, &moves, &mut p.ctx, &p.sk).failure,
+                None
+            );
+            store.save(&s).unwrap();
+        }
+        let loaded = store.load("TEST01").ok().unwrap();
+        assert_eq!(
+            serde_json::to_string(&loaded).unwrap(),
+            serde_json::to_string(&s).unwrap()
+        );
+        let again = replay::<LiarsDice>(&loaded).unwrap();
+        assert_eq!((again.state, again.head), (t.state, t.head));
+        store.save(&loaded).unwrap();
+        assert_eq!(store.load("TEST01").ok().unwrap().log.len(), s.log.len());
+    }
+
+    #[test]
+    fn marks_are_private_atomic_and_read_back() {
+        use crate::engine::hw;
+        use crate::engine::testkit::seated;
+
+        let tmp = TempRoot::new();
+        let store = Store::at(tmp.0.clone());
+        store.prepare().unwrap();
+        let (s, _, players) = seated::<Farkle>(&RuleSet::kcd(), &["Alice", "Bob"]);
+        store.save(&s).unwrap();
+        assert_eq!(store.read_hw("TEST01", "p1").unwrap(), None);
+        let path = tmp.0.join("sessions/TEST01.p1.hw");
+        fs::write(&path, "old").unwrap();
+        set_mode(&path, 0o644).unwrap();
+
+        store
+            .write_hw("TEST01", "p1", &hw::mark(&s, &players[0].sk))
+            .unwrap();
+        assert_eq!(mode(&path), 0o600);
+        assert!(!tmp.0.join("sessions/TEST01.p1.hw.tmp").exists());
+        let raw = store.read_hw("TEST01", "p1").unwrap().unwrap();
+        hw::check(&s, "p1", &players[0].sk.verifying_key(), Some(&raw)).unwrap();
+        assert_eq!(store.read_hw("TEST01", "p2").unwrap(), None);
+    }
+
+    #[test]
+    fn locking_needs_an_existing_session() {
+        let tmp = TempRoot::new();
+        let store = Store::at(tmp.0.clone());
+        store.prepare().unwrap();
+        assert_eq!(
+            store.lock("TEST01").unwrap_err(),
+            "no session `TEST01` found"
+        );
+        assert!(!tmp.0.join("sessions/TEST01.lock").exists());
+    }
+
+    /// A6: serde's error text quotes the file back; it reaches the terminal inert.
+    #[test]
+    fn a_corrupt_file_is_reported_inertly() {
+        let tmp = TempRoot::new();
+        let store = Store::at(tmp.0.clone());
+        store.prepare().unwrap();
+        let mut v = serde_json::to_value(session()).unwrap();
+        v["\u{1b}]0;pwned\u{7}"] = serde_json::json!(1);
+        fs::write(tmp.0.join("sessions/TEST01.json"), v.to_string()).unwrap();
+        let Err(LoadError::Corrupt(m)) = store.load("TEST01") else {
+            panic!("an unknown key must be refused")
+        };
+        assert!(
+            m.starts_with("session file doesn't parse: unknown field `\\u{1b}]0;pwned\\u{7}`"),
+            "{m}"
+        );
+        assert!(!m.contains(['\u{1b}', '\u{7}']));
+    }
+
     #[test]
     fn the_lock_is_exclusive() {
         let tmp = TempRoot::new();

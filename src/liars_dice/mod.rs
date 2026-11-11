@@ -1057,6 +1057,231 @@ mod tests {
         }
     }
 
+    // ---- cheating attempts ----
+
+    fn sb(round: u32) -> [u8; 32] {
+        dice::secret(&player(1).ctx.secrets, round)
+    }
+
+    fn sa(round: u32) -> [u8; 32] {
+        dice::secret(&player(0).ctx.secrets, round)
+    }
+
+    fn honest(seat: usize, s: &mut Session, moves: &[Move]) {
+        let mut t = replay::<LiarsDice>(s).unwrap();
+        let mut p = player(seat);
+        assert_eq!(
+            apply_chain(s, &mut t, seat, moves, &mut p.ctx, &p.sk).failure,
+            None
+        );
+    }
+
+    fn game_hex(s: &Session, seq: usize, kind: &str, field: &str) -> [u8; 32] {
+        let v = &body(s, seq)[kind][field];
+        let mut out = [0; 32];
+        hex::decode_to_slice(v.as_str().unwrap(), &mut out).unwrap();
+        out
+    }
+
+    /// Round 2 of the walkthrough, with Bob on a modified binary: he commits
+    /// after Alice, so her C and n are on the log for him to copy. Bob signs
+    /// whatever `c`, `n` (a function of the CSET) and `s` he likes; Alice
+    /// stays honest. Returns the replay of the finished round.
+    fn bob_cheats_round_2(
+        c: impl Fn(&Session) -> [u8; 32],
+        n: impl Fn(&Session, [u8; 32]) -> [u8; 32],
+        s: [u8; 32],
+    ) -> Result<(), Broken> {
+        let (mut log, _, _) = walkthrough();
+        log.log.truncate(12); // through Bob's reveal{1}; he skips the pipelined commit
+        honest(0, &mut log, &[]); // 12 reveal → round 2, 13 commit{2}
+        let c = c(&log);
+        forge(
+            &mut log,
+            1,
+            json!({"commit": {"round": 2, "c": hex::encode(c)}}),
+        ); // 14
+        honest(0, &mut log, &[]); // 15 entropy{2}
+        let cset = dice::commitment_set([&game_hex(&log, 13, "commit", "c"), &c]);
+        let n = n(&log, cset);
+        forge(
+            &mut log,
+            1,
+            json!({"entropy": {"round": 2, "n": hex::encode(n)}}),
+        ); // 16
+        forge(&mut log, 1, json!({"bid": {"qty": 1, "face": 2}})); // 17
+        honest(0, &mut log, &[Move::Liar]); // 18 call, 19 reveal, 20 commit{3}
+        forge(
+            &mut log,
+            1,
+            json!({"reveal": {"round": 2, "s": hex::encode(s)}}),
+        ); // 21
+        replay::<LiarsDice>(&log).map(|_| ())
+    }
+
+    fn honest_n(_: &Session, cset: [u8; 32]) -> [u8; 32] {
+        dice::entropy("TEST01", 2, "p2", &sb(2), &cset)
+    }
+
+    #[test]
+    fn commitments_bind_round_seat_and_session() {
+        let own = |_: &Session| dice::commitment("TEST01", 2, "p2", &sb(2));
+        bob_cheats_round_2(own, honest_n, sb(2)).expect("the honest control resolves");
+
+        let doesnt_open =
+            "BROKEN at seq 21: the revealed secret doesn't open p2's round 2 commitment";
+        // Round 1's commitment replayed in round 2: neither secret opens it.
+        let replayed = |s: &Session| game_hex(s, 3, "commit", "c");
+        let n1 = |_: &Session, cset| dice::entropy("TEST01", 2, "p2", &sb(1), &cset);
+        let b = bob_cheats_round_2(replayed, n1, sb(1)).unwrap_err();
+        assert_eq!(b.to_string(), doesnt_open);
+        let b = bob_cheats_round_2(replayed, honest_n, sb(2)).unwrap_err();
+        assert_eq!(b.to_string(), doesnt_open);
+        // Alice's commitment copied off the log, even opened with her real secret.
+        let copied = |s: &Session| game_hex(s, 13, "commit", "c");
+        let alice_c2 = game_hex(&walkthrough().0, 14, "commit", "c");
+        assert_eq!(alice_c2, dice::commitment("TEST01", 2, "p1", &sa(2)));
+        let na = |_: &Session, cset| dice::entropy("TEST01", 2, "p2", &sa(2), &cset);
+        let b = bob_cheats_round_2(copied, na, sa(2)).unwrap_err();
+        assert_eq!(b.to_string(), doesnt_open);
+        // A commitment made for another session.
+        let elsewhere = |_: &Session| dice::commitment("TEST02", 2, "p2", &sb(2));
+        let b = bob_cheats_round_2(elsewhere, honest_n, sb(2)).unwrap_err();
+        assert_eq!(b.to_string(), doesnt_open);
+    }
+
+    /// A3 beyond made-up bytes: entropy copied from the other seat, or
+    /// replayed from an earlier round, doesn't match the revealed secret.
+    #[test]
+    fn copied_or_replayed_entropy_is_caught_at_reveal() {
+        let own = |_: &Session| dice::commitment("TEST01", 2, "p2", &sb(2));
+        let wrong = "BROKEN at seq 21: entropy for round 2 doesn't match the revealed secret";
+        let alices = |s: &Session, _| game_hex(s, 15, "entropy", "n");
+        let b = bob_cheats_round_2(own, alices, sb(2)).unwrap_err();
+        assert_eq!(b.to_string(), wrong);
+        let round_1 = |s: &Session, _| game_hex(s, 6, "entropy", "n");
+        let b = bob_cheats_round_2(own, round_1, sb(2)).unwrap_err();
+        assert_eq!(b.to_string(), wrong);
+    }
+
+    /// Reveals carry no dice, so swapping dice means changing an input to
+    /// them: a commitment, an entropy, or whose seat an entry is. Every such
+    /// edit breaks the log, even when the author re-signs their own entry.
+    #[test]
+    fn editing_commit_entropy_or_seat_to_swap_dice_breaks_the_log() {
+        let (full, _, _) = walkthrough();
+        let sig_fails =
+            |seq| format!("BROKEN at seq {seq}: signature doesn't verify under the author's key");
+
+        let mut s = full.clone();
+        s.log[3].body = Body::Game(json!({"commit": {"round": 1, "c": hex::encode([1; 32])}}));
+        rehash(&mut s.log[3]);
+        assert_eq!(broken(&s).to_string(), sig_fails(3));
+
+        let mut s = full.clone();
+        s.log[6].body = Body::Game(json!({"entropy": {"round": 1, "n": hex::encode([1; 32])}}));
+        rehash(&mut s.log[6]);
+        assert_eq!(broken(&s).to_string(), sig_fails(6));
+
+        // Bob rewrites his own entropy and re-signs it: Alice's later entries
+        // still point at the original.
+        let mut s = full.clone();
+        s.log[6].body = Body::Game(json!({"entropy": {"round": 1, "n": hex::encode([1; 32])}}));
+        resign(&mut s.log[6], 1);
+        assert_eq!(
+            broken(&s).to_string(),
+            "BROKEN at seq 7: prev doesn't match the previous entry's hash"
+        );
+
+        // Swap the two entropies' authors.
+        let mut s = full.clone();
+        s.log[5].author = Some("p2".into());
+        s.log[6].author = Some("p1".into());
+        rehash(&mut s.log[5]);
+        assert_eq!(broken(&s).to_string(), sig_fails(5));
+
+        // Swap Alice and Bob's seats in the roster.
+        let mut s = full.clone();
+        let Body::Genesis(g) = &mut s.log[0].body else {
+            unreachable!()
+        };
+        g.roster.swap(0, 1);
+        (g.roster[0].seat, g.roster[1].seat) = ("p1".into(), "p2".into());
+        rehash(&mut s.log[0]);
+        assert_eq!(
+            broken(&s).to_string(),
+            "BROKEN at seq 1: prev doesn't match the previous entry's hash"
+        );
+
+        // Move Alice's register onto Bob's seat.
+        let mut s = full.clone();
+        s.log[1].body = Body::Register(crate::engine::log::Register {
+            seat: "p2".into(),
+            pubkey: Hex(player(0).sk.verifying_key().to_bytes()),
+        });
+        s.log[1].author = Some("p2".into());
+        rehash(&mut s.log[1]);
+        assert_eq!(broken(&s).to_string(), sig_fails(1));
+    }
+
+    /// A seat's own valid signature doesn't make its move legal on another
+    /// seat's turn.
+    #[test]
+    fn a_bid_or_call_signed_by_the_wrong_seat_is_out_of_turn() {
+        let (full, _, _) = walkthrough();
+        let mut s = full.clone();
+        s.log.truncate(7); // Bidding, Alice to move
+        forge(&mut s, 1, json!({"bid": {"qty": 2, "face": 6}}));
+        assert_eq!(
+            broken(&s).to_string(),
+            "BROKEN at seq 7: p2 bid out of turn"
+        );
+
+        let mut s = full.clone();
+        s.log.truncate(8); // Alice bid 2×6, Bob to move
+        forge(&mut s, 0, json!({"bid": {"qty": 3, "face": 6}}));
+        assert_eq!(
+            broken(&s).to_string(),
+            "BROKEN at seq 8: p1 bid out of turn"
+        );
+
+        let mut s = full.clone();
+        s.log.truncate(8);
+        forge(&mut s, 0, json!({"call": {"kind": "liar"}}));
+        assert_eq!(
+            broken(&s).to_string(),
+            "BROKEN at seq 8: p1 called out of turn"
+        );
+    }
+
+    #[test]
+    fn a_signature_transplanted_to_another_entry_fails() {
+        let (full, _, _) = walkthrough();
+        // Bob's bid signature onto Bob's call.
+        let mut s = full.clone();
+        s.log[10].sig = s.log[8].sig;
+        assert_eq!(
+            broken(&s).to_string(),
+            "BROKEN at seq 10: signature doesn't verify under the author's key"
+        );
+        // Bob's whole signed bid replayed at the end of the log.
+        let mut s = full.clone();
+        let mut e = s.log[8].clone();
+        s.log.push(e.clone());
+        assert_eq!(
+            broken(&s).to_string(),
+            "BROKEN at seq 17: seq is 8, expected 17"
+        );
+        e.seq = 17;
+        e.prev = s.log[16].hash;
+        rehash(&mut e);
+        s.log[17] = e;
+        assert_eq!(
+            broken(&s).to_string(),
+            "BROKEN at seq 17: signature doesn't verify under the author's key"
+        );
+    }
+
     // ---- rules ----
 
     fn bidding(rules: RuleSet, seats: usize) -> State {

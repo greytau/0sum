@@ -873,6 +873,112 @@ mod tests {
         );
     }
 
+    fn push_register(s: &mut Session, seat: &str, author: &str, key_of: usize) {
+        let body = Body::Register(Register {
+            seat: seat.into(),
+            pubkey: Hex(player(key_of).sk.verifying_key().to_bytes()),
+        });
+        let prev = s.log.last().unwrap().hash;
+        let seq = s.log.len() as u64;
+        s.log.push(Entry::signed(
+            seq,
+            0,
+            author,
+            prev,
+            body,
+            &player(key_of).sk,
+        ));
+    }
+
+    /// A registered seat can't be taken over by a fresh key, before or after
+    /// the game starts, and nobody registers a seat that isn't theirs or
+    /// doesn't exist.
+    #[test]
+    fn a_seat_registers_once_and_only_itself() {
+        let mut s = played();
+        push_register(&mut s, "p2", "p2", 2);
+        assert_eq!(
+            broken_at(&s).to_string(),
+            "BROKEN at seq 7: seat p2 registered twice"
+        );
+        let mut s = played();
+        s.log.truncate(3);
+        push_register(&mut s, "p1", "p1", 2);
+        assert_eq!(
+            broken_at(&s).to_string(),
+            "BROKEN at seq 3: seat p1 registered twice"
+        );
+        let mut s = played();
+        s.log.truncate(2);
+        push_register(&mut s, "p2", "p1", 2);
+        assert_eq!(
+            broken_at(&s).to_string(),
+            "BROKEN at seq 2: a seat can only register itself"
+        );
+        let mut s = played();
+        s.log.truncate(2);
+        push_register(&mut s, "p3", "p3", 2);
+        assert_eq!(broken_at(&s).to_string(), "BROKEN at seq 2: no seat `p3`");
+
+        let (mut s, mut t, _) = seated::<Farkle>(&RuleSet::kcd(), &["Alice", "Bob"]);
+        assert_eq!(
+            append_register(&mut s, &mut t, 1, &player(2).sk).unwrap_err(),
+            "`Bob` has already registered"
+        );
+        assert_eq!(s.log.len(), 3);
+    }
+
+    /// A6: an unknown key or variant name carrying escapes is reported inert.
+    #[test]
+    fn unknown_names_in_a_signed_event_are_inert() {
+        let mut s = played();
+        s.log[6].body = Body::Game(json!({ "\u{1b}[2J\u{202e}rolled": {} }));
+        resign(&mut s.log[6], 1);
+        let b = broken_at(&s).to_string();
+        assert!(
+            b.starts_with(
+                "BROKEN at seq 6: event doesn't parse: unknown variant `\\u{1b}[2J\\u{202e}rolled`"
+            ),
+            "{b}"
+        );
+        s.log[6].body = Body::Game(json!({ "rolled": { "dice": [1], "\u{7}\u{1b}]0;x": 1 } }));
+        resign(&mut s.log[6], 1);
+        let b = broken_at(&s).to_string();
+        assert!(b.contains("unknown field `\\u{7}\\u{1b}]0;x`"), "{b}");
+        assert!(!b.contains(['\u{1b}', '\u{7}', '\u{202e}']));
+    }
+
+    /// A7: verify bounds the roster and knows every ruleset name.
+    #[test]
+    fn verify_refuses_a_roster_out_of_bounds_or_an_unknown_ruleset() {
+        let genesis_of = |edit: &dyn Fn(&mut Genesis)| {
+            let mut s = played();
+            s.log.truncate(1);
+            let Body::Genesis(g) = &mut s.log[0].body else {
+                unreachable!()
+            };
+            edit(g);
+            rehash(&mut s.log[0]);
+            broken_at(&s).to_string()
+        };
+        let solo = genesis_of(&|g| g.roster.truncate(1));
+        assert_eq!(solo, "BROKEN at seq 0: need 2 to 8 players");
+        let nine = genesis_of(&|g| {
+            g.roster = (1..=9)
+                .map(|i| Seat {
+                    seat: format!("p{i}"),
+                    name: format!("P{i}"),
+                })
+                .collect()
+        });
+        assert_eq!(nine, "BROKEN at seq 0: need 2 to 8 players");
+        let renamed = genesis_of(&|g| g.ruleset["name"] = json!("kcd-but-mine"));
+        assert!(
+            renamed.starts_with("BROKEN at seq 0: unknown ruleset"),
+            "{renamed}"
+        );
+    }
+
     #[test]
     fn roster_names_must_differ_ignoring_case() {
         let names = |v: &[&str]| v.iter().map(|n| n.to_string()).collect::<Vec<_>>();
