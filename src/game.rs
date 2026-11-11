@@ -256,7 +256,10 @@ mod tests {
     fn single_moves_still_parse_alone() {
         assert_eq!(parse("roll").unwrap(), vec![Move::Roll]);
         assert_eq!(parse("bank").unwrap(), vec![Move::Bank]);
-        assert_eq!(parse("keep 1 5 5").unwrap(), vec![Move::Keep(vec![1, 5, 5])]);
+        assert_eq!(
+            parse("keep 1 5 5").unwrap(),
+            vec![Move::Keep(vec![1, 5, 5])]
+        );
     }
 
     #[test]
