@@ -6,7 +6,7 @@
 //!   - [`score_selection`]: can a chosen set of dice be *fully* partitioned into
 //!     scoring groups, and what is the best total? (keep validation)
 
-use crate::ruleset::RuleSet;
+use crate::farkle::ruleset::RuleSet;
 
 /// Face counts indexed 1..=6 (index 0 unused).
 type Counts = [u8; 7];
@@ -141,7 +141,7 @@ fn best_decomposition(c: Counts, rules: &RuleSet) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ruleset::RuleSet;
+    use crate::farkle::ruleset::RuleSet;
 
     fn kcd() -> RuleSet {
         RuleSet::kcd()
