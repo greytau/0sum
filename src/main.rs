@@ -193,7 +193,9 @@ fn print_whereabouts<G: Game>(s: &Session, t: &Table<G>, me: usize) {
     println!("{}", head_line(s));
 }
 
-/// A4's check: after replay, under the lock, before any duty.
+/// A4's check: after replay, under the lock, before any duty. `play` then
+/// writes the mark at this head at once, so a mark that can't be written
+/// refuses before anything is appended (H1).
 fn check_mark<G: Game>(
     store: &Store,
     s: &Session,
@@ -205,6 +207,8 @@ fn check_mark<G: Game>(
     hw::check(s, &t.seats[seat], &sk.verifying_key(), raw.as_deref())
 }
 
+/// After a save, a failed write is returned only once the run has printed what
+/// it appended and the head (H1): a reveal never lands silently.
 fn write_mark<G: Game>(
     store: &Store,
     s: &Session,
@@ -276,7 +280,7 @@ impl<G: Game> Driver for Engine<G> {
             }
         };
         store.save(&s)?;
-        write_mark(store, &s, &t, seat, &sk)?;
+        let marked = write_mark(store, &s, &t, seat, &sk);
 
         println!();
         println!(
@@ -302,6 +306,7 @@ impl<G: Game> Driver for Engine<G> {
             println!("Waiting on: {}", t.unregistered().join(", "));
         }
         print_whereabouts(&s, &t, seat);
+        marked?;
         chain.failure.map_or(Ok(()), Err)
     }
 
@@ -323,8 +328,8 @@ impl<G: Game> Driver for Engine<G> {
             )
         })?;
         check_mark(store, &s, &t, me, &sk)?;
+        write_mark(store, &s, &t, me, &sk)?;
         if !t.started() {
-            write_mark(store, &s, &t, me, &sk)?;
             return Err(format!(
                 "not everyone has registered yet (waiting on: {})",
                 t.unregistered().join(", ")
@@ -341,12 +346,13 @@ impl<G: Game> Driver for Engine<G> {
         if appended {
             store.save(&s)?;
         }
-        write_mark(store, &s, &t, me, &sk)?;
+        let marked = write_mark(store, &s, &t, me, &sk);
         print_steps(&chain, &t.names);
         if appended || tokens.is_empty() {
             print_status(&t, me, &ctx);
         }
         print_whereabouts(&s, &t, me);
+        marked?;
         chain.failure.map_or(Ok(()), Err)
     }
 

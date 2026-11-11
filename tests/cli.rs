@@ -398,3 +398,68 @@ fn escapes_in_file_keys_reach_the_terminal_inert() {
     );
     assert!(!text.contains(['\u{1b}', '\u{7}', '\u{202e}']), "{text}");
 }
+
+fn plant_temp_dirs(sb: &Sandbox, sid: &str, seat: &str) {
+    let dir = sb.root().join("sessions");
+    for name in [
+        format!("{sid}.{seat}.hw.tmp"),
+        format!("{sid}.{seat}.hw.0000000000000000.tmp"),
+        format!("{sid}.{seat}.hw.3f9a0c17d2e4b865.tmp"),
+        format!("{sid}.json.tmp"),
+        format!("{sid}.json.a1b2c3d4e5f60718.tmp"),
+    ] {
+        fs::create_dir(dir.join(&name)).unwrap();
+        fs::write(dir.join(name).join("x"), "").unwrap();
+    }
+}
+
+/// H1: directories planted at temp names can't make a reveal land silently.
+/// A directory squatting the mark itself refuses before anything is appended;
+/// otherwise the reveal run prints the round and the head as usual.
+#[test]
+fn planted_temp_dirs_cant_hide_a_reveal() {
+    let sb = Sandbox::new();
+    let (sid, alice, bob) = liars_dice_table(&sb);
+    sb.run(&["play"], "", Some(&alice)); // 4 commit, 5 entropy
+    sb.run(&["play"], "", Some(&bob)); // 6 entropy
+    sb.run(&["play", "bid", "1", "2"], "", Some(&alice)); // 7
+    let o = sb.run(&["play", "liar"], "", Some(&bob)); // 8 call, 9 reveal, 10 commit
+    assert!(out(&o).contains("waiting on Alice's reveal"), "{}", out(&o));
+    plant_temp_dirs(&sb, &sid, "p1");
+
+    let path = sb.root().join(format!("sessions/{sid}.json"));
+    let log = fs::read_to_string(&path).unwrap();
+    let mark = sb.root().join(format!("sessions/{sid}.p1.hw"));
+    let aside = sb.root().join("p1.hw.aside");
+    fs::rename(&mark, &aside).unwrap();
+    fs::create_dir(&mark).unwrap();
+    let o = sb.run(&["play"], "", Some(&alice));
+    assert_eq!(o.status.code(), Some(1));
+    assert_eq!(out(&o), "");
+    assert_eq!(fs::read_to_string(&path).unwrap(), log);
+    fs::remove_dir(&mark).unwrap();
+    fs::rename(&aside, &mark).unwrap();
+
+    let o = sb.run(&["play"], "", Some(&alice)); // 11 reveal → resolve, 12, 13
+    assert!(o.status.success(), "{}", err(&o));
+    assert!(out(&o).contains("Round 1 result: Bob called liar on Alice's 1×2."));
+    assert!(out(&o).contains("\nhead 13:"), "{}", out(&o));
+    let o = sb.run(&["verify", &sid], "", None);
+    assert!(out(&o).contains("OK  14 entries  head 13:"), "{}", out(&o));
+    let o = sb.run(&["play"], "", Some(&alice));
+    assert!(o.status.success(), "{}", err(&o));
+}
+
+#[test]
+fn planted_temp_dirs_cant_eat_a_password() {
+    let sb = Sandbox::new();
+    let o = sb.run(&["new", "ld"], "2\nAlice\nBob\n", None);
+    let sid = after(&out(&o), "SESSION ID:").to_string();
+    sb.run(&["register", &sid, "Alice"], "", None);
+    plant_temp_dirs(&sb, &sid, "p2");
+    let o = sb.run(&["register", &sid, "Bob"], "", None);
+    assert!(o.status.success(), "{}", err(&o));
+    let bob = after(&out(&o), "PASSWORD (keep secret):").to_string();
+    assert!(out(&o).contains("\nhead 3:"), "{}", out(&o));
+    assert!(sb.run(&["play"], "", Some(&bob)).status.success());
+}

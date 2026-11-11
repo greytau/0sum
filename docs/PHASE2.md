@@ -367,7 +367,9 @@ $XDG_CONFIG_HOME/0sum or ~/.0sum/        mode 0700
   `OpenOptions::mode` only applies at creation (the #6 trap). These modes protect against
   *other unix users*. A player who shares your uid can read everything anyway, which is
   exactly why §2/§4 store nothing secret.
-- **Atomic write.** Write `<SID>.json.tmp` (create, truncate, 0600), then `rename` over `<SID>.json`.
+- **Atomic write.** Write `<SID>.json.<16 hex from OsRng>.tmp` (`create_new`, 0600), then `rename`
+  over `<SID>.json`; on any failure, remove the temp file. A fresh random name means nothing planted
+  at a predictable temp path can make the write fail (H1). Marks are written the same way.
 - **Lock.** Two terminals act at the same time, and the commit phase is simultaneous by nature.
   Every load → verify → append → save cycle holds an exclusive `std::fs::File::lock()` on
   `<SID>.lock`. This is std since Rust 1.89, so set `rust-version = "1.89"`. Lock the
@@ -393,8 +395,15 @@ sig    Ed25519(sk_seat, "0sum/v2/hw\0" ‖ lp(SID) ‖ h0 ‖ u64be(seq) ‖ has
   - `seq >= len(log)` or `log[seq].hash != hash` → refuse with
     `ROLLBACK: you last saw seq <seq>:<12hex>; this log no longer contains it. Don't play on. Run 0sum verify.`
   - refuse = exit 1, append nothing, write nothing.
-- **Write** atomically (tmp + rename, 0600), after the session save succeeds and still under
-  the lock, at the current head. Also on look-only runs, and at `register`.
+- **Write** atomically (random tmp + rename, 0600), still under the lock, at the current head:
+  - in `play`, once right after the check passes, before any duty. If that write fails, refuse
+    before anything is appended.
+  - again after the session save succeeds, in `play` (look-only runs too) and at `register`. If
+    this write fails, the run first prints everything it would have (steps, status,
+    `your last move:` and the head, and at `register` the password), and only then exits 1 with
+    the error (H1). A reveal never lands silently.
+  - `register` doesn't do the early write: the seat has no registration on disk yet, so a mark
+    written before the save would turn any failed save into a permanently refused seat.
 - Every password-holding invocation also prints the player's own last move in words and the
   head, so a human notices a vanished move even without the mark:
   `your last move: called liar on Alice's 3×6 (round 1, seq 10)` / `head 16:<12hex>`.
@@ -819,6 +828,15 @@ Said plainly, so nobody overclaims:
    **What the high-water mark (§6.1) does:** each seat's binary remembers, under its own
    signature, the last head it saw, and refuses a log that no longer contains it. That stops
    every **unplanned** rollback: truncating the log after the fact, or restoring only the log.
+   This holds because the mark always gets written once the log is saved: `play` writes it
+   before any duty (and refuses if it can't), the temp name is random so nothing planted can
+   block the rename, and a failed write after the save is reported only after the head and
+   the round are printed, never instead of them (§6.1, H1).
+   **The remaining vector is the write itself:** racing it (inotify on the sessions directory,
+   putting the old log and the victim's old mark back the moment the new ones land), or
+   SIGSTOPping or killing the victim's process between its save and its mark write. Both need
+   the attack planned and running alongside the victim's run; a killed run is visible to its
+   human, and the head it printed (if it got that far) won't match the next one.
    **What it doesn't do:** players share a uid and a disk. A cheater who **plans** it and
    snapshots the **whole directory** (log and every seat's mark) before calling restores a
    consistent world: Alice's mark is old again, and her binary can't tell. The remaining

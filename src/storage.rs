@@ -7,6 +7,9 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 
+use rand::rngs::OsRng;
+use rand::RngCore;
+
 use crate::engine::escape;
 use crate::engine::hw::HighWater;
 use crate::engine::log::Session;
@@ -130,7 +133,7 @@ impl Store {
         Ok(true)
     }
 
-    /// Atomic: write `<SID>.json.tmp` (0600), then rename over `<SID>.json`.
+    /// Atomic: write a fresh `<SID>.json.<rand>.tmp` (0600), then rename over `<SID>.json`.
     pub fn save(&self, s: &Session) -> Result<(), String> {
         atomic_write(&self.session_path(&s.session_id), &json(s)?)
     }
@@ -179,18 +182,28 @@ impl Store {
     }
 }
 
+/// `<path>.<16 random hex>.tmp`, created fresh: a file or directory planted at
+/// a predictable temp name can't make the write fail (H1).
 fn atomic_write(path: &Path, text: &str) -> Result<(), String> {
     let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
+    tmp.push(format!(".{:016x}.tmp", OsRng.next_u64()));
     let tmp = PathBuf::from(tmp);
-    let mut f = private_file(OpenOptions::new().write(true).create(true).truncate(true))
+    let mut f = private_file(OpenOptions::new().write(true).create_new(true))
         .open(&tmp)
         .map_err(|e| format!("open {}: {e}", tmp.display()))?;
-    set_mode(&tmp, 0o600)?;
-    f.write_all(text.as_bytes())
-        .and_then(|_| f.sync_all())
-        .map_err(|e| format!("write {}: {e}", tmp.display()))?;
-    fs::rename(&tmp, path).map_err(|e| format!("rename into {}: {e}", path.display()))
+    let written = set_mode(&tmp, 0o600)
+        .and_then(|()| {
+            f.write_all(text.as_bytes())
+                .and_then(|_| f.sync_all())
+                .map_err(|e| format!("write {}: {e}", tmp.display()))
+        })
+        .and_then(|()| {
+            fs::rename(&tmp, path).map_err(|e| format!("rename into {}: {e}", path.display()))
+        });
+    if written.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    written
 }
 
 fn json(s: &Session) -> Result<String, String> {
@@ -243,8 +256,6 @@ mod tests {
         fs::create_dir_all(tmp.0.join("sessions")).unwrap();
         set_mode(&tmp.0, 0o755).unwrap();
         set_mode(&tmp.0.join("sessions"), 0o755).unwrap();
-        fs::write(tmp.0.join("sessions/TEST01.json.tmp"), "stale").unwrap();
-        set_mode(&tmp.0.join("sessions/TEST01.json.tmp"), 0o644).unwrap();
 
         store.prepare().unwrap();
         store.save(&session()).unwrap();
@@ -254,8 +265,71 @@ mod tests {
         assert_eq!(mode(&tmp.0.join("sessions")), 0o700);
         assert_eq!(mode(&tmp.0.join("sessions/TEST01.json")), 0o600);
         assert_eq!(mode(&tmp.0.join("sessions/TEST01.lock")), 0o600);
-        assert!(!tmp.0.join("sessions/TEST01.json.tmp").exists());
+        assert_eq!(temp_files(&tmp.0), Vec::<String>::new());
         assert_eq!(store.load("TEST01").ok().unwrap().log.len(), 1);
+    }
+
+    fn temp_files(root: &Path) -> Vec<String> {
+        fs::read_dir(root.join("sessions"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect()
+    }
+
+    /// H1: whatever squats on the old fixed temp name, or on any other temp
+    /// name, the write goes through and leaves the squatter alone.
+    #[test]
+    fn a_planted_temp_name_cant_stop_a_write() {
+        use crate::engine::hw;
+        use crate::engine::testkit::seated;
+
+        let tmp = TempRoot::new();
+        let store = Store::at(tmp.0.clone());
+        store.prepare().unwrap();
+        let (s, _, players) = seated::<Farkle>(&RuleSet::kcd(), &["Alice", "Bob"]);
+        let dir = tmp.0.join("sessions");
+        let squatters = [
+            "TEST01.json.tmp",
+            "TEST01.p1.hw.tmp",
+            "TEST01.json.0000000000000000.tmp",
+            "TEST01.p1.hw.ffffffffffffffff.tmp",
+        ];
+        for name in squatters {
+            fs::create_dir(dir.join(name)).unwrap();
+        }
+        fs::write(dir.join("TEST01.json.tmp/x"), "stale").unwrap();
+
+        store.save(&s).unwrap();
+        store
+            .write_hw("TEST01", "p1", &hw::mark(&s, &players[0].sk))
+            .unwrap();
+        assert_eq!(store.load("TEST01").ok().unwrap().log.len(), s.log.len());
+        assert!(store.read_hw("TEST01", "p1").unwrap().is_some());
+        let mut left = temp_files(&tmp.0);
+        left.sort();
+        let mut want: Vec<String> = squatters.iter().map(|n| n.to_string()).collect();
+        want.sort();
+        assert_eq!(left, want);
+        assert_eq!(
+            fs::read_to_string(dir.join("TEST01.json.tmp/x")).unwrap(),
+            "stale"
+        );
+    }
+
+    /// A failed write takes its temp file with it.
+    #[test]
+    fn a_failed_write_leaves_no_temp_file() {
+        let tmp = TempRoot::new();
+        let store = Store::at(tmp.0.clone());
+        store.prepare().unwrap();
+        fs::create_dir(tmp.0.join("sessions/TEST01.json")).unwrap();
+        fs::write(tmp.0.join("sessions/TEST01.json/x"), "").unwrap();
+        assert!(store
+            .save(&session())
+            .unwrap_err()
+            .starts_with("rename into "));
+        assert_eq!(temp_files(&tmp.0), Vec::<String>::new());
     }
 
     #[test]
@@ -370,7 +444,7 @@ mod tests {
             .write_hw("TEST01", "p1", &hw::mark(&s, &players[0].sk))
             .unwrap();
         assert_eq!(mode(&path), 0o600);
-        assert!(!tmp.0.join("sessions/TEST01.p1.hw.tmp").exists());
+        assert_eq!(temp_files(&tmp.0), Vec::<String>::new());
         let raw = store.read_hw("TEST01", "p1").unwrap().unwrap();
         hw::check(&s, "p1", &players[0].sk.verifying_key(), Some(&raw)).unwrap();
         assert_eq!(store.read_hw("TEST01", "p2").unwrap(), None);
