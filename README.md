@@ -17,16 +17,32 @@ The christening project of the [`greytau`](https://github.com/greytau) org.
 
 ## Status
 
-**Phase 1 — work in progress.** Hotseat Farkle: the engine, the `Game` trait, the
-signed hash-chained state log, and the CLI flow. Plain-text UI. Nothing playable
-yet — this is the genesis scaffold.
+**Phase 1 — hotseat Farkle is playable.** The engine, the `Game` trait, rulesets,
+and the CLI flow are in. Plain-text UI. The default ruleset is `kcd` (Kingdom Come:
+Deliverance scoring, first to 4000; the Devil's head wild die is not implemented).
+`0sum new farkle --ruleset classic` plays to 10000, scores three pairs and two
+triplets, and requires 500 to get on the board.
+
+**Not in yet: the tamper-evident log.** The session file is plain JSON with no
+signatures or hash chain, and passwords sit unhashed in the local index — so for
+now play is on the honor system. Signing and hash-chaining are the rest of Phase 1.
+Dice are rolled locally (a CSPRNG seeded from OS entropy), which is fine when both
+players share a screen; cross-machine play needs the commit-reveal dice described
+in the design, which is Phase 2.
 
 The command builds to a binary named `0sum`:
 
 ```console
-$ 0sum
-0sum — provably-fair CLI games (WIP)
+$ 0sum new farkle                 # prompts for players, prints a SESSION ID
+$ 0sum register <SESSION> <name>  # claim your seat, prints your password (keep it secret)
+$ 0sum play <password> roll
+$ 0sum play <password> keep 1 5   # keep scoring dice you rolled (here, a 1 and a 5)
+$ 0sum play <password> bank       # end your turn and keep the points
+$ 0sum play <password> keep 1 5 bank   # moves chain in one call; r / k / b also work
 ```
+
+Chained moves apply in order and stop at the first one that ends your turn (bank,
+bust, or a win) or is illegal; the moves before it still count.
 
 ## Design
 
@@ -40,7 +56,7 @@ cards), the stakes/veto layer, and the build phases — lives in
 
 ```console
 cargo build          # produces target/debug/0sum
-cargo run            # prints the WIP banner
+cargo run -- new farkle   # start a game (see Status for the full flow)
 ```
 
 Requires a recent stable Rust toolchain.
