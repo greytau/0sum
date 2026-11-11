@@ -871,8 +871,10 @@ Said plainly, so nobody overclaims:
     the real ceiling of this design on a shared account. Nothing in a program can fix it.
 11. **Seat squatting (A9).** Anyone can run `0sum register <SID> Bob` before Bob does. It fails
     loudly for Bob (`` `Bob` has already registered ``), never silently: re-create the session.
-12. **Duplicate JSON keys (A9)** inside a `game` body collapse to the last value before hashing,
-    so the raw file can show a key the log doesn't mean. Read `0sum verify`, not the raw file.
+12. **Duplicate JSON keys (A9)** inside a `game` body or the genesis `ruleset` (both held as
+    untyped JSON) collapse to the last value before hashing, so the raw file can show a key the
+    log doesn't mean. Read `0sum verify`, not the raw file. Everywhere else the file is parsed
+    straight into its typed structs, and a duplicate key there is refused (H4).
 
 ---
 

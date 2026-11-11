@@ -159,8 +159,18 @@ impl Store {
 
     pub fn load(&self, sid: &str) -> Result<Session, LoadError> {
         let path = self.session_path(sid);
-        let text = fs::read_to_string(&path)
-            .map_err(|_| LoadError::Missing(format!("no session `{sid}` found")))?;
+        let text = match fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                return Err(LoadError::Missing(format!("no session `{sid}` found")))
+            }
+            Err(e) => {
+                return Err(LoadError::Corrupt(format!(
+                    "can't read {sid}.json: {}",
+                    escape(&e.to_string())
+                )))
+            }
+        };
         let corrupt =
             |e: String| LoadError::Corrupt(format!("session file doesn't parse: {}", escape(&e)));
         let raw: serde_json::Value =
@@ -170,7 +180,9 @@ impl Store {
                 "session {sid} is a v1 (unsigned) session and can't be played by this version — start a new one"
             )));
         }
-        let s: Session = serde_json::from_value(raw).map_err(|e| corrupt(e.to_string()))?;
+        // From the text, not the Value: a Value keeps only the last of two
+        // duplicate keys, so a decoy `author` would vanish unnoticed (H4).
+        let s: Session = serde_json::from_str(&text).map_err(|e| corrupt(e.to_string()))?;
         if s.session_id != sid {
             return Err(LoadError::Corrupt(format!(
                 "{sid}.json claims to be session {}",
@@ -479,6 +491,48 @@ mod tests {
             "{m}"
         );
         assert!(!m.contains(['\u{1b}', '\u{7}']));
+    }
+
+    /// H4: a second `author` key in an entry is refused, not collapsed.
+    #[test]
+    fn a_duplicate_key_in_an_entry_is_refused() {
+        use crate::engine::testkit::seated;
+
+        let tmp = TempRoot::new();
+        let store = Store::at(tmp.0.clone());
+        store.prepare().unwrap();
+        let (s, _, _) = seated::<Farkle>(&RuleSet::kcd(), &["Alice", "Bob"]);
+        store.save(&s).unwrap();
+        let path = tmp.0.join("sessions/TEST01.json");
+        let text = fs::read_to_string(&path).unwrap();
+        let doctored = text.replacen(
+            r#""author": "p2","#,
+            r#""author": "p1", "author": "p2","#,
+            1,
+        );
+        assert_ne!(doctored, text);
+        fs::write(&path, doctored).unwrap();
+        let Err(LoadError::Corrupt(m)) = store.load("TEST01") else {
+            panic!("a duplicate key must be refused")
+        };
+        assert!(
+            m.starts_with("session file doesn't parse: duplicate field `author`"),
+            "{m}"
+        );
+    }
+
+    /// D2: only a missing file is "no session"; anything else says what broke.
+    #[test]
+    fn an_unreadable_session_isnt_reported_missing() {
+        let tmp = TempRoot::new();
+        let store = Store::at(tmp.0.clone());
+        store.prepare().unwrap();
+        assert!(matches!(store.load("TEST01"), Err(LoadError::Missing(_))));
+        fs::create_dir(tmp.0.join("sessions/TEST01.json")).unwrap();
+        let Err(LoadError::Corrupt(m)) = store.load("TEST01") else {
+            panic!("a directory isn't a missing session")
+        };
+        assert!(m.starts_with("can't read TEST01.json: "), "{m}");
     }
 
     #[test]

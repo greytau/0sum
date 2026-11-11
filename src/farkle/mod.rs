@@ -293,6 +293,10 @@ impl Game for Farkle {
         })
     }
 
+    fn game_over(st: &State, names: &[String]) -> Option<String> {
+        st.winner.map(|w| format!("Game over — {} won.", names[w]))
+    }
+
     fn render(st: &State, names: &[String], _me: Option<usize>, _ctx: Option<&Ctx>) -> String {
         let mut out = vec![format!("--- scores (target {}) ---", st.rules.target_score)];
         let current = st.winner.is_none();
@@ -587,28 +591,61 @@ pub(crate) mod tests {
         assert_eq!(t.state.totals, vec![0, 0]);
     }
 
+    /// Real, seeded play (roll, best keep, bank) until the seat to move will
+    /// win with the best keep of its next roll. Returns that seat and keep.
+    pub(crate) fn one_keep_from_a_win() -> (Session, Table<Farkle>, Vec<Player>, usize, Vec<u8>) {
+        let rules = RuleSet::kcd();
+        let (mut s, mut t, mut players) = seated::<Farkle>(&rules, &["Alice", "Bob"]);
+        for _ in 0..10_000 {
+            let st = &t.state;
+            let seat = Farkle::to_move(st).expect("nobody has won yet");
+            let mut peek = players[seat].ctx.rng.clone();
+            let roll: Vec<u8> = (0..st.dice_available)
+                .map(|_| peek.gen_range(1..=6))
+                .collect();
+            let keep = best_keep(&roll, &rules);
+            let turn = st.turn_total + score_selection(&keep, &rules).unwrap_or(0);
+            let can_bank = st.totals[seat] > 0 || turn >= rules.on_board_minimum;
+            if !keep.is_empty() && can_bank && st.totals[seat] + turn >= rules.target_score {
+                return (s, t, players, seat, keep);
+            }
+            let moves = match (keep.is_empty(), can_bank) {
+                (true, _) => vec![Move::Roll],
+                (false, true) => vec![Move::Roll, Move::Keep(keep), Move::Bank],
+                (false, false) => vec![Move::Roll, Move::Keep(keep)],
+            };
+            assert_eq!(
+                play(&mut s, &mut t, &mut players, seat, &moves).failure,
+                None
+            );
+        }
+        panic!("no win within 10000 turns");
+    }
+
+    /// The win comes from real signed moves, so the log replays to it (§13).
     #[test]
     fn chain_win_halts_and_reports() {
-        let rules = RuleSet::kcd();
-        let seed = seed_where(&rules, |scores| scores);
-        let (mut s, mut t, mut players) = seated::<Farkle>(&rules, &["Alice", "Bob"]);
-        // One scoring keep from the win. (Only in memory: a doctored
-        // ruleset or total would rightly fail replay.)
-        t.state.totals[0] = rules.target_score - 50;
-        players[0].ctx.rng = StdRng::seed_from_u64(seed);
-        let keep = best_keep(&roll_with(seed, 6), &rules);
-
+        let (mut s, mut t, mut players, seat, keep) = one_keep_from_a_win();
         let chain = play(
             &mut s,
             &mut t,
             &mut players,
-            0,
+            seat,
             &[Move::Roll, Move::Keep(keep), Move::Bank, Move::Roll],
         );
         assert_eq!(chain.failure.as_deref(), Some("the game is over"));
         assert_eq!(chain.steps.len(), 3);
-        assert_eq!(Farkle::winner(&t.state), Some(0));
-        assert!(Farkle::render(&t.state, &t.names, Some(0), None).ends_with(">>> Alice WINS! <<<"));
+        assert_eq!(Farkle::winner(&t.state), Some(seat));
+        let name = &t.names[seat];
+        assert!(Farkle::render(&t.state, &t.names, Some(seat), None)
+            .ends_with(&format!(">>> {name} WINS! <<<")));
+        assert_eq!(
+            Farkle::game_over(&t.state, &t.names),
+            Some(format!("Game over — {name} won."))
+        );
+        let replayed = replay::<Farkle>(&s).expect("the signed log verifies");
+        assert_eq!(replayed.state, t.state);
+        assert_eq!(replayed.head, t.head);
     }
 
     #[test]

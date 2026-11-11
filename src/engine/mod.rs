@@ -80,6 +80,13 @@ pub trait Game: 'static {
     /// `None` = a protocol entry, not something a human chose.
     fn recap(before: &Self::State, ev: &Self::Event, names: &[String]) -> Option<String>;
 
+    /// On a finished game, the line any `play` prints before showing the table
+    /// and succeeding (Farkle, as in phase 1). `None` = a move on a finished
+    /// game fails with "the game is over".
+    fn game_over(_state: &Self::State, _names: &[String]) -> Option<String> {
+        None
+    }
+
     /// Where in the game `before` is, e.g. `round 2`, to place a recap.
     fn moment(_before: &Self::State) -> Option<String> {
         None

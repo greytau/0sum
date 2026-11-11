@@ -335,6 +335,12 @@ impl<G: Game> Driver for Engine<G> {
                 t.unregistered().join(", ")
             ));
         }
+        if let Some(line) = G::game_over(&t.state, &t.names) {
+            println!("{line}");
+            print_status(&t, me, &ctx);
+            print_whereabouts(&s, &t, me);
+            return Ok(());
+        }
         let moves = if tokens.is_empty() {
             Vec::new()
         } else {
@@ -396,5 +402,49 @@ fn shell_quote(s: &str) -> String {
         s.to_string()
     } else {
         format!("'{}'", s.replace('\'', "'\\''"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use engine::testkit::PASSWORDS;
+    use farkle::tests::one_keep_from_a_win;
+    use farkle::Move;
+
+    /// D9: as in phase 1, any `play` on a won Farkle game shows the result and
+    /// succeeds, appending nothing.
+    #[test]
+    fn play_on_a_finished_farkle_game_succeeds() {
+        let (mut s, mut t, mut players, seat, keep) = one_keep_from_a_win();
+        let p = &mut players[seat];
+        let moves = [Move::Roll, Move::Keep(keep), Move::Bank];
+        assert_eq!(
+            apply_chain(&mut s, &mut t, seat, &moves, &mut p.ctx, &p.sk).failure,
+            None
+        );
+        assert!(t.state.winner.is_some());
+
+        let root = std::env::temp_dir().join(format!("0sum-main-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = Store::at(root.clone());
+        store.prepare().unwrap();
+        assert!(store.create(&s).unwrap());
+        for (i, p) in players.iter().enumerate() {
+            store
+                .write_hw("TEST01", &t.seats[i], &hw::mark(&s, &p.sk))
+                .unwrap();
+        }
+        let farkle = Engine::<Farkle>(PhantomData);
+        for pw in &PASSWORDS[..2] {
+            let pw = Password::parse(pw).unwrap();
+            for tokens in [&["roll"][..], &[], &["bank"], &["yeet"]] {
+                let tokens: Vec<String> = tokens.iter().map(|t| t.to_string()).collect();
+                let loaded = store.load("TEST01").ok().unwrap();
+                assert_eq!(farkle.play(&store, loaded, &pw, &tokens), Ok(()));
+            }
+        }
+        assert_eq!(store.load("TEST01").ok().unwrap().log.len(), s.log.len());
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

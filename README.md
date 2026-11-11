@@ -47,6 +47,16 @@ Farkle's default ruleset is `kcd` (Kingdom Come: Deliverance scoring, first to
 10000. Liar's Dice defaults to `classic` (5 dice each, 1s wild); `--ruleset natural`
 makes 1s an ordinary face and allows `spot`.
 
+## Building
+
+```console
+cargo install --path .   # builds 0sum and puts it on your PATH (~/.cargo/bin)
+0sum new ld              # start a game (see "Play Liar's Dice in two terminals")
+```
+
+Requires Rust 1.89 or newer. `cargo build` alone leaves the binary at
+`target/debug/0sum`, which isn't on your `PATH`; the commands below assume `0sum` is.
+
 ## Your password, once per terminal
 
 `register` prints your password once. Load it into a shell variable that is
@@ -84,8 +94,17 @@ B$ read -rs ZP; zs() { ZEROSUM_PASSWORD="$ZP" 0sum "$@"; }
 ```
 
 **Then loop: look, then act.** Committing, rolling and revealing happen
-automatically every time you run `zs play`, so there is no `roll` command.
-`zs play` with no move shows the table and your dice:
+automatically every time you run `zs play`, so there is no `roll` command. Each
+player's first look rolls their dice, and you see yours once everyone else has
+rolled, so round 1 starts with a look from each of you:
+
+```console
+A$ zs play      # Alice commits and rolls; waiting on Bob's roll
+B$ zs play      # Bob rolls, and now sees his dice
+A$ zs play      # Alice sees hers; her turn to bid
+```
+
+`zs play` with no move shows the table and your dice. Here is Bob's second look:
 
 ```console
 B$ zs play
@@ -95,6 +114,9 @@ B$ zs play
   your dice: 4 4 4 5 6
 
 Alice's turn to bid
+
+your last move: registered (seq 2)
+head 6:78d811f01b8c
 ```
 
 On your turn, bid a quantity and a face ("at least two 4s on the table"), or
@@ -159,15 +181,6 @@ The original design brief (CLI flow, the three-tier hidden-state format, phased
 fairness, the stakes/veto layer, the build phases) is
 [`docs/DESIGN.md`](docs/DESIGN.md), tracked canonically in
 [issue #1](https://github.com/greytau/0sum/issues/1).
-
-## Building
-
-```console
-cargo build          # produces target/debug/0sum
-cargo run -- new ld       # start a game (see "Play Liar's Dice in two terminals")
-```
-
-Requires a recent stable Rust toolchain.
 
 ## License
 
