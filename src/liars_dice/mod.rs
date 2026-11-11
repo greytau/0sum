@@ -6,6 +6,8 @@
 pub mod dice;
 pub mod ruleset;
 
+use std::num::IntErrorKind;
+
 use serde::{Deserialize, Serialize};
 
 use crate::engine::log::{Hex, Hex32};
@@ -310,8 +312,12 @@ impl Game for LiarsDice {
                     return Err("bid takes a quantity and a face, e.g. `bid 3 5`".into());
                 };
                 let num = |t: &String| {
-                    t.parse::<u8>()
-                        .map_err(|_| format!("`{t}` is not a number"))
+                    t.parse::<u8>().map_err(|e| match e.kind() {
+                        IntErrorKind::PosOverflow => {
+                            format!("`{t}` is too big for a bid (255 at most)")
+                        }
+                        _ => format!("`{t}` is not a number"),
+                    })
                 };
                 return Ok(vec![Move::Bid(num(q)?, num(f)?)]);
             }
@@ -558,8 +564,7 @@ impl Game for LiarsDice {
             }
             Event::Bid { qty, face } => vec![format!("{name} bids {qty}×{face}")],
             Event::Call { kind } => {
-                let (_, q, f) = *before.bids.last().expect("fold accepted the call");
-                let (bidder, _, _) = *before.bids.last().unwrap();
+                let (bidder, q, f) = *before.bids.last().expect("fold accepted the call");
                 let call = match kind {
                     Call::Liar => "LIAR",
                     Call::Spot => "SPOT ON",
@@ -1455,6 +1460,10 @@ mod tests {
         assert_eq!(p("exact").unwrap(), vec![Move::Spot]);
         assert!(p("bid 3").is_err());
         assert!(p("bid x 5").unwrap_err().contains("not a number"));
+        assert_eq!(
+            p("bid 300 5").unwrap_err(),
+            "`300` is too big for a bid (255 at most)"
+        );
         assert!(p("liar liar").is_err());
         assert!(p("roll").unwrap_err().contains("unknown move"));
         assert!(p("").is_err());

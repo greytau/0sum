@@ -128,7 +128,7 @@ fn cmd_register(store: &Store, sid: &str, name: &str) -> Result<(), String> {
 }
 
 fn cmd_play(store: &Store, tokens: &[String]) -> Result<(), String> {
-    if tokens.first().is_some_and(|t| keys::looks_like_password(t)) {
+    if tokens.iter().any(|t| keys::looks_like_password(t)) {
         return Err("don't put your password on the command line — it's in your shell history now; use ZEROSUM_PASSWORD".into());
     }
     let raw = std::env::var(PASSWORD_ENV)
@@ -153,7 +153,7 @@ fn cmd_verify(store: &Store, sid: &str) -> Result<(), String> {
     };
     let checked = genesis_game(&s)
         .map_err(|b| b.to_string())
-        .and_then(|g| driver(g).map_err(|e| Broken { seq: 0, reason: e }.to_string()))
+        .and_then(|g| driver(g).map_err(|e| format!("BROKEN at seq 0: {e}")))
         .and_then(|d| d.verify(&s));
     match checked {
         Ok(()) => Ok(()),
@@ -173,17 +173,28 @@ fn ctx_for(pw: &Password) -> Ctx {
     }
 }
 
-fn print_steps<G: Game>(chain: &Chain<G>, names: &[String]) {
+/// Prints the narration and returns it, for [`print_status`].
+fn print_steps<G: Game>(chain: &Chain<G>, names: &[String]) -> Vec<String> {
+    let mut said = Vec::new();
     for step in &chain.steps {
         for line in G::narrate(&step.before, step.author, &step.event, &step.after, names) {
             println!("{line}");
+            said.push(line);
         }
     }
+    said
 }
 
-fn print_status<G: Game>(t: &Table<G>, me: usize, ctx: &Ctx) {
+/// The table. A render can open with a block the narration just printed (a
+/// resolved round's result is in both); that block isn't printed twice.
+fn print_status<G: Game>(t: &Table<G>, me: usize, ctx: &Ctx, said: &[String]) {
+    let view = G::render(&t.state, &t.names, Some(me), Some(ctx));
+    let view = match view.split_once("\n\n") {
+        Some((top, rest)) if top.lines().all(|l| said.iter().any(|s| s == l)) => rest,
+        _ => &view,
+    };
     println!();
-    println!("{}", G::render(&t.state, &t.names, Some(me), Some(ctx)));
+    println!("{view}");
 }
 
 /// A4: on every password-holding run, so a human notices a vanished move.
@@ -205,6 +216,28 @@ fn check_mark<G: Game>(
 ) -> Result<(), String> {
     let raw = store.read_hw(&s.session_id, &t.seats[seat])?;
     hw::check(s, &t.seats[seat], &sk.verifying_key(), raw.as_deref())
+}
+
+/// A password with no seat: if one of this session's marks is signed by it,
+/// the log was rolled back past its register (H3).
+fn not_seated<G: Game>(
+    store: &Store,
+    s: &Session,
+    t: &Table<G>,
+    sk: &ed25519_dalek::SigningKey,
+) -> String {
+    let key = sk.verifying_key();
+    for seat in &t.seats {
+        if let Ok(Some(raw)) = store.read_hw(&s.session_id, seat) {
+            if hw::signed_by(s, &key, &raw) {
+                return format!("ROLLBACK: your seat {seat}'s registration is gone from this log. Don't play on. Run 0sum verify.");
+            }
+        }
+    }
+    format!(
+        "this password doesn't belong to any seat in session {}",
+        t.session_id
+    )
 }
 
 /// After a save, a failed write is returned only once the run has printed what
@@ -269,7 +302,12 @@ impl<G: Game> Driver for Engine<G> {
         let pw = Password::generate(&t.session_id);
         let mut ctx = ctx_for(&pw);
         let sk = ctx.secrets.signing_key();
-        check_mark(store, &s, &t, seat, &sk)?;
+        if store.read_hw(&sid, &t.seats[seat])?.is_some() {
+            return Err(format!(
+                "seat {} has a high-water mark but no registration in this log: the log was rolled back past {}'s register, or the file was planted. Run 0sum verify.",
+                t.seats[seat], t.names[seat]
+            ));
+        }
         append_register(&mut s, &mut t, seat, &sk)?;
         let chain = if t.started() {
             apply_chain(&mut s, &mut t, seat, &[], &mut ctx, &sk)
@@ -298,10 +336,10 @@ impl<G: Game> Driver for Engine<G> {
         println!("  {LOAD_HINT}");
         println!("Then play with `zs play …` (plain `zs play` shows the table).");
         println!();
-        print_steps(&chain, &t.names);
+        let said = print_steps(&chain, &t.names);
         if t.started() {
             println!("All players in.");
-            print_status(&t, seat, &ctx);
+            print_status(&t, seat, &ctx, &said);
         } else {
             println!("Waiting on: {}", t.unregistered().join(", "));
         }
@@ -321,15 +359,13 @@ impl<G: Game> Driver for Engine<G> {
         let mut t = replay::<G>(&s).map_err(|b| refuse_broken(&sid, b))?;
         let mut ctx = ctx_for(pw);
         let sk = ctx.secrets.signing_key();
-        let me = t.seat_of(&sk.verifying_key()).ok_or_else(|| {
-            format!(
-                "this password doesn't belong to any seat in session {}",
-                t.session_id
-            )
-        })?;
+        let Some(me) = t.seat_of(&sk.verifying_key()) else {
+            return Err(not_seated(store, &s, &t, &sk));
+        };
         check_mark(store, &s, &t, me, &sk)?;
         write_mark(store, &s, &t, me, &sk)?;
         if !t.started() {
+            print_whereabouts(&s, &t, me);
             return Err(format!(
                 "not everyone has registered yet (waiting on: {})",
                 t.unregistered().join(", ")
@@ -337,14 +373,20 @@ impl<G: Game> Driver for Engine<G> {
         }
         if let Some(line) = G::game_over(&t.state, &t.names) {
             println!("{line}");
-            print_status(&t, me, &ctx);
+            print_status(&t, me, &ctx, &[]);
             print_whereabouts(&s, &t, me);
             return Ok(());
         }
         let moves = if tokens.is_empty() {
             Vec::new()
         } else {
-            G::parse_moves(tokens)?
+            match G::parse_moves(tokens) {
+                Ok(moves) => moves,
+                Err(e) => {
+                    print_whereabouts(&s, &t, me);
+                    return Err(e);
+                }
+            }
         };
         let before = s.log.len();
         let chain = apply_chain(&mut s, &mut t, me, &moves, &mut ctx, &sk);
@@ -353,9 +395,9 @@ impl<G: Game> Driver for Engine<G> {
             store.save(&s)?;
         }
         let marked = write_mark(store, &s, &t, me, &sk);
-        print_steps(&chain, &t.names);
+        let said = print_steps(&chain, &t.names);
         if appended || tokens.is_empty() {
-            print_status(&t, me, &ctx);
+            print_status(&t, me, &ctx, &said);
         }
         print_whereabouts(&s, &t, me);
         marked?;

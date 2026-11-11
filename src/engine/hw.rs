@@ -41,6 +41,17 @@ pub fn mark(s: &Session, sk: &SigningKey) -> HighWater {
 
 const DONT: &str = "Don't play on. Run 0sum verify.";
 
+/// Whether `raw` is a mark for this session signed by `key`, wherever it points.
+pub fn signed_by(s: &Session, key: &VerifyingKey, raw: &str) -> bool {
+    serde_json::from_str::<HighWater>(raw).is_ok_and(|hw| {
+        key.verify_strict(
+            &message(s, hw.seq, &hw.hash),
+            &Signature::from_bytes(&hw.sig.0),
+        )
+        .is_ok()
+    })
+}
+
 /// Run after replay, under the lock, before any duty. `raw` is the mark
 /// file's contents, if it exists. Err = refuse: append nothing, write nothing.
 pub fn check(s: &Session, seat: &str, key: &VerifyingKey, raw: Option<&str>) -> Result<(), String> {

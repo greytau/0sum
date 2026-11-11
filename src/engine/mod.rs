@@ -106,8 +106,8 @@ pub struct Table<G: Game> {
     pub keys: Vec<Option<VerifyingKey>>,
     pub state: G::State,
     pub head: Hex32,
-    /// Per seat: (seq, words) of the last thing that seat chose to do.
-    pub last_move: Vec<Option<(u64, String)>>,
+    /// Per seat: the last thing that seat chose to do, in words.
+    pub last_move: Vec<Option<String>>,
 }
 
 impl<G: Game> Table<G> {
@@ -123,7 +123,7 @@ impl<G: Game> Table<G> {
     /// rolled-back log is visible to the human, not only to the mark (A4).
     pub fn recap_line(&self, seat: usize) -> String {
         match &self.last_move[seat] {
-            Some((_, words)) => format!("your last move: {words}"),
+            Some(words) => format!("your last move: {words}"),
             None => "your last move: none yet".into(),
         }
     }
@@ -133,7 +133,7 @@ impl<G: Game> Table<G> {
             Some(at) => format!("{at}, seq {seq}"),
             None => format!("seq {seq}"),
         };
-        self.last_move[seat] = Some((seq, format!("{words} ({tag})")));
+        self.last_move[seat] = Some(format!("{words} ({tag})"));
     }
 
     pub fn unregistered(&self) -> Vec<&str> {

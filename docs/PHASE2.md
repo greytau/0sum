@@ -85,7 +85,7 @@ example: TEST01-AAAAAAAAAAAAAAAAAAAAAAAAAA
 prk  = HKDF-Extract(salt = "0sum/v2/" || SID,  ikm = SECRET as ASCII bytes)
 
 sign_seed     = HKDF-Expand(prk, "0sum/v2/sign", 32)            -> ed25519 SigningKey::from_bytes
-state_key     = HKDF-Expand(prk, "0sum/v2/state-key", 32)       -> RESERVED, unused in phase 2
+state_key     = HKDF-Expand(prk, "0sum/v2/state-key", 32)       -> RESERVED, not derived in phase 2
 game secrets  = HKDF-Expand(prk, "0sum/v2/<game-id>/<label>...", 32)
 ```
 
@@ -346,7 +346,7 @@ Your dice are visible as soon as every *other* live seat has published entropy. 
 entropy isn't needed for your dice. Before that, the render says `waiting on <names> to roll`.
 Reading the disk without your password yields commitments only (G1, G4).
 
-`state_key` is derived and reserved. Phase 2 encrypts nothing, because a deterministic
+`state_key` is reserved, not derived in phase 2. Phase 2 encrypts nothing, because a deterministic
 derivation of private state removes the need to store it. If a later game truly needs stored
 private state, use `chacha20poly1305` (XChaCha20-Poly1305) keyed by `state_key`, and not before.
 
@@ -394,6 +394,10 @@ sig    Ed25519(sk_seat, "0sum/v2/hw\0" ‖ lp(SID) ‖ h0 ‖ u64be(seq) ‖ has
   - unparsable, or the signature doesn't verify under my key → refuse
   - `seq >= len(log)` or `log[seq].hash != hash` → refuse with
     `ROLLBACK: you last saw seq <seq>:<12hex>; this log no longer contains it. Don't play on. Run 0sum verify.`
+  - at `register`, any mark for the seat refuses (no key exists for it yet) with
+    `seat <seat> has a high-water mark but no registration in this log: the log was rolled back past <name>'s register, or the file was planted. Run 0sum verify.`
+  - at `play`, a password that matches no seat but verifies one of the session's marks refuses with
+    `ROLLBACK: your seat <seat>'s registration is gone from this log. Don't play on. Run 0sum verify.`
   - refuse = exit 1, append nothing, write nothing.
 - **Write** atomically (random tmp + rename, 0600), still under the lock, at the current head:
   - in `play`, once right after the check passes, before any duty. If that write fails, refuse
@@ -603,9 +607,9 @@ ever flow into producing events and rendering, never into validating them.** Tie
 
 ```rust
 pub struct Table<G: Game> {
-    pub session_id: String, pub names: Vec<String>, pub seats: Vec<String>,
-    pub keys: Vec<Option<VerifyingKey>>, pub state: G::State, pub head: [u8; 32],
-    pub last_move: Vec<Option<(u64, String)>>,   // per seat, for `your last move:` (A4)
+    pub session_id: String, pub rules: G::Rules, pub names: Vec<String>, pub seats: Vec<String>,
+    pub keys: Vec<Option<VerifyingKey>>, pub state: G::State, pub head: Hex32,
+    pub last_move: Vec<Option<String>>,   // per seat, the words for `your last move:` (A4)
 }
 impl<G: Game> Table<G> { pub fn started(&self) -> bool { self.keys.iter().all(Option::is_some) } }
 
@@ -646,9 +650,9 @@ appended → write the mark → print `narrate` for each step, then `render`, th
 ### 9.5 Registry
 
 ```rust
-trait Driver { fn new(&self, ruleset: Option<&str>) -> Result<(), String>;
-               fn register(&self, s: Session, name: &str) -> Result<(), String>;
-               fn play(&self, s: Session, pw: &Password, tokens: &[String]) -> Result<(), String>;
+trait Driver { fn create(&self, store: &Store, ruleset: Option<&str>) -> Result<(), String>;
+               fn register(&self, store: &Store, s: Session, name: &str) -> Result<(), String>;
+               fn play(&self, store: &Store, s: Session, pw: &Password, tokens: &[String]) -> Result<(), String>;
                fn verify(&self, s: &Session) -> Result<(), String>; }
 struct Engine<G>(PhantomData<G>);
 impl<G: Game> Driver for Engine<G> { /* generic bodies */ }
@@ -662,7 +666,7 @@ fn driver(game: &str) -> Result<&'static dyn Driver, String> {
 }
 ```
 
-`new` dispatches on its argument. `register`, `play` and `verify` load the session, read
+`create` (the `new` command) dispatches on its argument. `register`, `play` and `verify` load the session, read
 `genesis.game`, and dispatch on that. One `match` is the whole registry. It doesn't need to be
 a plugin system.
 
@@ -690,7 +694,7 @@ auto-answers roll requests). Out of scope for this phase. See §14.
 //! Declarative Liar's Dice rules. Pure data; mechanics read every variant from here.
 
 /// Stored in genesis so every session is self-describing and reproducible.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuleSet {
     pub name: String,

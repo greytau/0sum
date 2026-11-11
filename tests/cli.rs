@@ -134,8 +134,10 @@ fn a_two_player_session_end_to_end() {
 
     let o = sb.run(&["play", "roll"], "", None);
     assert!(err(&o).contains("set ZEROSUM_PASSWORD"));
-    let o = sb.run(&["play", &alice, "roll"], "", Some(&alice));
-    assert!(err(&o).contains("don't put your password on the command line"));
+    for args in [&["play", &alice, "roll"][..], &["play", "roll", &alice]] {
+        let o = sb.run(args, "", Some(&alice));
+        assert!(err(&o).contains("don't put your password on the command line"));
+    }
     let o = sb.run(&["play", "roll"], "", Some(&bob));
     assert!(err(&o).contains("it's Alice's turn, not yours"));
 
@@ -240,7 +242,10 @@ fn a_rolled_back_log_is_refused_with_rollback() {
     assert!(out(&o).contains("waiting on Alice's reveal"), "{}", out(&o));
     let o = sb.run(&["play"], "", Some(&alice)); // 11 reveal → resolve, 12, 13
     assert!(out(&o).contains("Round 1 result: Bob called liar on Alice's 1×2."));
+    assert_eq!(out(&o).matches("Round 1 result:").count(), 1, "{}", out(&o));
     assert!(out(&o).contains("head 13:"));
+    let o = sb.run(&["play"], "", Some(&bob));
+    assert_eq!(out(&o).matches("Round 1 result:").count(), 1, "{}", out(&o));
 
     fs::write(&path, &snapshot).unwrap();
     let mark = sb.root().join(format!("sessions/{sid}.p1.hw"));
@@ -340,7 +345,10 @@ fn a_mark_planted_for_an_unregistered_seat_refuses_registration() {
         fs::write(&planted, &mark).unwrap();
         let o = sb.run(&["register", &sid, "Bob"], "", None);
         assert_eq!(o.status.code(), Some(1));
-        assert!(err(&o).contains("high-water mark"), "{}", err(&o));
+        assert_eq!(
+            err(&o).trim(),
+            "error: seat p2 has a high-water mark but no registration in this log: the log was rolled back past Bob's register, or the file was planted. Run 0sum verify."
+        );
         assert!(!out(&o).contains("PASSWORD"));
         assert_eq!(fs::read_to_string(&path).unwrap(), log);
         assert_eq!(fs::read_to_string(&planted).unwrap(), mark);
@@ -462,4 +470,74 @@ fn planted_temp_dirs_cant_eat_a_password() {
     let bob = after(&out(&o), "PASSWORD (keep secret):").to_string();
     assert!(out(&o).contains("\nhead 3:"), "{}", out(&o));
     assert!(sb.run(&["play"], "", Some(&bob)).status.success());
+}
+
+/// H3: a log rolled back past your own register says so, not "wrong password".
+#[test]
+fn a_rollback_past_your_register_is_named() {
+    let sb = Sandbox::new();
+    let o = sb.run(&["new", "ld"], "2\nAlice\nBob\n", None);
+    let sid = after(&out(&o), "SESSION ID:").to_string();
+    let path = sb.root().join(format!("sessions/{sid}.json"));
+    let genesis_only = fs::read_to_string(&path).unwrap();
+    let o = sb.run(&["register", &sid, "Alice"], "", None);
+    let alice = after(&out(&o), "PASSWORD (keep secret):").to_string();
+    fs::write(&path, &genesis_only).unwrap();
+    let o = sb.run(&["play"], "", Some(&alice));
+    assert_eq!(o.status.code(), Some(1));
+    assert_eq!(
+        err(&o).trim(),
+        "error: ROLLBACK: your seat p1's registration is gone from this log. Don't play on. Run 0sum verify."
+    );
+    let stranger = format!("{sid}-AAAAAAAAAAAAAAAAAAAAAAAAAA");
+    let o = sb.run(&["play"], "", Some(&stranger));
+    assert!(
+        err(&o).contains("this password doesn't belong to any seat"),
+        "{}",
+        err(&o)
+    );
+}
+
+/// D4: a refused look still shows where you are.
+#[test]
+fn refusals_after_the_mark_check_still_print_the_head() {
+    let sb = Sandbox::new();
+    let o = sb.run(&["new", "ld"], "2\nAlice\nBob\n", None);
+    let sid = after(&out(&o), "SESSION ID:").to_string();
+    let o = sb.run(&["register", &sid, "Alice"], "", None);
+    let alice = after(&out(&o), "PASSWORD (keep secret):").to_string();
+    let o = sb.run(&["play"], "", Some(&alice));
+    assert_eq!(o.status.code(), Some(1));
+    assert!(err(&o).contains("not everyone has registered yet"));
+    assert!(
+        out(&o).contains("your last move: registered (seq 1)\nhead 1:"),
+        "{}",
+        out(&o)
+    );
+    sb.run(&["register", &sid, "Bob"], "", None);
+    let o = sb.run(&["play", "bid", "300", "5"], "", Some(&alice));
+    assert_eq!(
+        err(&o).trim(),
+        "error: `300` is too big for a bid (255 at most)"
+    );
+    assert!(out(&o).contains("\nhead "), "{}", out(&o));
+}
+
+/// D5: an unknown game id is escaped once, not twice.
+#[test]
+fn an_unknown_game_is_escaped_once() {
+    let sb = Sandbox::new();
+    let o = sb.run(&["new", "ld"], "2\nAlice\nBob\n", None);
+    let sid = after(&out(&o), "SESSION ID:").to_string();
+    let path = sb.root().join(format!("sessions/{sid}.json"));
+    let text = fs::read_to_string(&path).unwrap();
+    let doctored = text.replacen(r#""game": "liars-dice""#, r#""game": "chess\u001b""#, 1);
+    assert_ne!(doctored, text);
+    fs::write(&path, doctored).unwrap();
+    let o = sb.run(&["verify", &sid], "", None);
+    assert_eq!(o.status.code(), Some(1));
+    assert_eq!(
+        out(&o).trim(),
+        r"BROKEN at seq 0: unknown game `chess\u{1b}` (available: farkle, liars-dice)"
+    );
 }
