@@ -26,11 +26,24 @@ impl Sandbox {
     }
 
     fn run(&self, args: &[&str], stdin: &str, password: Option<&str>) -> Output {
+        self.run_with(args, stdin, password, &[])
+    }
+
+    fn run_with(
+        &self,
+        args: &[&str],
+        stdin: &str,
+        password: Option<&str>,
+        env: &[(&str, &str)],
+    ) -> Output {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_0sum"));
         cmd.args(args)
             .env("XDG_CONFIG_HOME", &self.0)
             .env("HOME", &self.0)
             .env_remove("ZEROSUM_PASSWORD")
+            .env_remove("ZEROSUM_FORMAT")
+            .env_remove("NO_COLOR")
+            .envs(env.iter().copied())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -540,4 +553,215 @@ fn an_unknown_game_is_escaped_once() {
         out(&o).trim(),
         r"BROKEN at seq 0: unknown game `chess\u{1b}` (available: battleship, farkle, liars-dice)"
     );
+}
+
+/// `C3-G3` → C3 D3 E3 F3 G3, from a ledger `your fleet:` line.
+fn ledger_squares(line: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for part in line.trim_start_matches("your fleet: ").split(" · ") {
+        let span = part.split(' ').nth(1).unwrap();
+        let (a, b) = span.split_once('-').unwrap();
+        let rc = |s: &str| (s.as_bytes()[0], s[1..].parse::<u8>().unwrap());
+        let ((r0, c0), (r1, c1)) = (rc(a), rc(b));
+        for r in r0..=r1 {
+            for c in c0..=c1 {
+                out.push(format!("{}{c}", r as char));
+            }
+        }
+    }
+    out
+}
+
+/// Two terminals, two passwords: Alice places by hand, Bob places at random
+/// and plays from the ledger. Alice reads Bob's own ledger (the test is the
+/// cheat here, not the binary) and sinks him; her next run reveals.
+#[test]
+fn battleship_two_terminals_to_a_winner() {
+    let sb = Sandbox::new();
+    let o = sb.run(&["new", "bs"], "Alice\nBob\n", None);
+    assert!(o.status.success(), "{}", err(&o));
+    assert!(out(&o).contains("Battleship is a 2-player game."));
+    assert!(!out(&o).contains("How many players"));
+    let sid = after(&out(&o), "SESSION ID:").to_string();
+    let o = sb.run(&["register", &sid, "Alice"], "", None);
+    assert!(out(&o).contains(r#"read -rs ZP; zs() { ZEROSUM_PASSWORD="$ZP" 0sum "$@"; }"#));
+    let alice = after(&out(&o), "PASSWORD (keep secret):").to_string();
+    let o = sb.run(&["register", &sid, "Bob", "--format", "LEDGER"], "", None);
+    assert!(
+        out(&o).contains(
+            r#"read -rs ZP; zs() { ZEROSUM_PASSWORD="$ZP" ZEROSUM_FORMAT=ledger 0sum "$@"; }"#
+        ),
+        "{}",
+        out(&o)
+    );
+    assert!(out(&o).contains("placing · you vs Alice · enemy placed 0 of 5, not locked"));
+    let bob = after(&out(&o), "PASSWORD (keep secret):").to_string();
+    let ledger = [("ZEROSUM_FORMAT", "ledger")];
+    let alice_play = |args: &[&str]| {
+        let mut a = vec!["play"];
+        a.extend(args);
+        let o = sb.run(&a, "", Some(&alice));
+        assert!(o.status.success(), "{}{}", out(&o), err(&o));
+        out(&o)
+    };
+    let bob_play = |args: &[&str]| {
+        let mut a = vec!["play"];
+        a.extend(args);
+        let o = sb.run_with(&a, "", Some(&bob), &ledger);
+        assert!(o.status.success(), "{}{}", out(&o), err(&o));
+        out(&o)
+    };
+
+    let text = alice_play(&[
+        "place",
+        "carrier",
+        "A1",
+        "h",
+        "battleship",
+        "C1",
+        "h",
+        "cruiser",
+        "E1",
+        "h",
+        "submarine",
+        "G1",
+        "h",
+        "destroyer",
+        "I1",
+        "h",
+        "ready",
+    ]);
+    assert!(text.contains("Alice locked the fleet"), "{text}");
+    assert!(
+        text.contains("--- battleship: Alice vs Bob, placing ---"),
+        "{text}"
+    );
+    let text = bob_play(&["place", "auto", "ready"]);
+    assert!(
+        text.contains("Both fleets locked. Alice fires first."),
+        "{text}"
+    );
+    let fleet = text
+        .lines()
+        .find(|l| l.starts_with("your fleet: "))
+        .unwrap();
+    let targets = ledger_squares(fleet);
+    assert_eq!(targets.len(), 17);
+    let water: Vec<String> = ["B", "D", "F", "H", "J"]
+        .iter()
+        .flat_map(|r| (1..=10).map(move |c| format!("{r}{c}")))
+        .collect();
+
+    for (n, sq) in targets.iter().enumerate() {
+        let text = alice_play(&[sq]);
+        assert!(text.contains(&format!("Alice fires at {sq}")), "{text}");
+        let shot = [water[n].as_str()];
+        let text = bob_play(if n < 16 { &shot } else { &[] });
+        assert!(text.contains(&format!("Bob: {sq} — hit")), "{text}");
+    }
+    let text = bob_play(&[]);
+    assert!(
+        text.starts_with("\nreveal · enemy sank your fleet · waiting on enemy's final reveal\n"),
+        "{text}"
+    );
+    let text = alice_play(&[]);
+    assert!(
+        text.contains("Alice won: sank Bob's fleet; Alice's fleet verified"),
+        "{text}"
+    );
+    let o = sb.run(&["play", "B5"], "", Some(&alice));
+    assert!(o.status.success());
+    assert!(out(&o).starts_with("Alice won: sank Bob's fleet; Alice's fleet verified\n"));
+
+    let o = sb.run(&["verify", &sid], "", None);
+    assert!(o.status.success(), "{}", out(&o));
+    let text = out(&o);
+    assert!(text.contains("Alice reveals: carrier A1 h, battleship C1 h, cruiser E1 h, submarine G1 h, destroyer I1 h — legal, every answer matched"), "{text}");
+    assert!(text.lines().last().unwrap().starts_with("OK  "), "{text}");
+}
+
+/// R3: `--format` is a request (unknown = error, nothing written); the env
+/// is a preference (unknown = the game's default, silently).
+#[test]
+fn render_formats_flag_errors_env_falls_back() {
+    let sb = Sandbox::new();
+    let o = sb.run(&["new", "battleship"], "Alice\nBob\n", None);
+    let sid = after(&out(&o), "SESSION ID:").to_string();
+    let path = sb.root().join(format!("sessions/{sid}.json"));
+    let before = fs::read_to_string(&path).unwrap();
+    let o = sb.run(&["register", &sid, "Alice", "--format", "harbor"], "", None);
+    assert_eq!(o.status.code(), Some(1));
+    assert_eq!(
+        err(&o).trim(),
+        "error: battleship has no `harbor` format (bridge, ledger, logbook)"
+    );
+    assert!(!out(&o).contains("PASSWORD"));
+    assert_eq!(fs::read_to_string(&path).unwrap(), before);
+    let o = sb.run(&["register", &sid, "Alice"], "", None);
+    let alice = after(&out(&o), "PASSWORD (keep secret):").to_string();
+    sb.run(&["register", &sid, "Bob"], "", None);
+
+    let o = sb.run(
+        &["play", "--format", "x\u{1b}[2J", "place", "auto"],
+        "",
+        Some(&alice),
+    );
+    assert_eq!(o.status.code(), Some(1));
+    assert_eq!(
+        err(&o).trim(),
+        r"error: battleship has no `x\u{1b}[2J` format (bridge, ledger, logbook)"
+    );
+    let log = fs::read_to_string(&path).unwrap();
+    let o = sb.run_with(&["play"], "", Some(&alice), &[("ZEROSUM_FORMAT", "harbor")]);
+    assert!(o.status.success());
+    assert!(
+        out(&o).contains("--- battleship: Alice vs Bob, placing ---"),
+        "{}",
+        out(&o)
+    );
+    assert_eq!(fs::read_to_string(&path).unwrap(), log);
+    let o = sb.run_with(
+        &["play", "--format", "bridge"],
+        "",
+        Some(&alice),
+        &[("NO_COLOR", "1")],
+    );
+    assert!(out(&o).contains("╭─ 0sum · battleship"), "{}", out(&o));
+    assert!(!out(&o).contains('\u{1b}'));
+    let o = sb.run(&["play", "--format", "bridge"], "", Some(&alice));
+    assert!(
+        out(&o).contains("\u{1b}[1m0sum · battleship\u{1b}[0m"),
+        "{}",
+        out(&o)
+    );
+    let o = sb.run_with(&["play"], "", Some(&alice), &[("ZEROSUM_FORMAT", "ledger")]);
+    assert!(
+        out(&o).starts_with("\nplacing · you vs Bob · "),
+        "{}",
+        out(&o)
+    );
+
+    // Farkle has one format: the env is ignored, the flag must name it.
+    let o = sb.run(&["new", "farkle"], "2\nAlice\nBob\n", None);
+    let fsid = after(&out(&o), "SESSION ID:").to_string();
+    let o = sb.run(
+        &["register", &fsid, "Alice", "--format", "ledger"],
+        "",
+        None,
+    );
+    assert_eq!(
+        err(&o).trim(),
+        "error: farkle has no `ledger` format (default)"
+    );
+    let o = sb.run(&["register", &fsid, "Alice"], "", None);
+    let fa = after(&out(&o), "PASSWORD (keep secret):").to_string();
+    let o = sb.run(&["register", &fsid, "Bob"], "", None);
+    let plain = out(&o);
+    assert!(plain.contains("Alice's turn — roll: zs play roll"));
+    let looks = |env: &[(&str, &str)]| {
+        let o = sb.run_with(&["play"], "", Some(&fa), env);
+        assert!(o.status.success(), "{}", err(&o));
+        out(&o)
+    };
+    assert_eq!(looks(&[("ZEROSUM_FORMAT", "ledger")]), looks(&[]));
 }
