@@ -4,8 +4,11 @@
 pub mod hw;
 pub mod keys;
 pub mod log;
+#[allow(dead_code)] // first user: battleship, next commit
+pub mod slots;
 
 use std::fmt::{self, Debug};
+use std::ops::RangeInclusive;
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand::rngs::StdRng;
@@ -28,6 +31,18 @@ pub trait Game: 'static {
     type Move: Clone + Debug + PartialEq;
     /// Must be `#[serde(deny_unknown_fields)]`: replay parses it strictly.
     type Event: Serialize + DeserializeOwned + Clone + Debug;
+    /// Render format ids this game draws; matched by [`resolve_format`].
+    const FORMATS: &'static [&'static str] = &["default"];
+
+    /// How many seats a session may have.
+    fn seats() -> RangeInclusive<usize> {
+        2..=MAX_SEATS
+    }
+
+    /// The format used when neither `--format` nor `ZEROSUM_FORMAT` picks one.
+    fn default_format(_tty: bool, _no_color: bool) -> &'static str {
+        Self::FORMATS[0]
+    }
 
     fn ruleset(name: &str) -> Result<Self::Rules, String>;
     fn rules_name(rules: &Self::Rules) -> &str;
@@ -55,6 +70,16 @@ pub trait Game: 'static {
 
     /// `None` = nobody (protocol wait / game over).
     fn to_move(state: &Self::State) -> Option<usize>;
+
+    /// May `me` make a human move now? The default is `to_move`'s answer;
+    /// a game with a simultaneous phase overrides it.
+    fn may_move(st: &Self::State, me: usize, names: &[String]) -> Result<(), String> {
+        match Self::to_move(st) {
+            Some(p) if p == me => Ok(()),
+            Some(o) => Err(format!("it's {}'s turn, not yours", names[o])),
+            None => Err(format!("waiting on {}", Self::waiting(st, names))),
+        }
+    }
     fn winner(state: &Self::State) -> Option<usize>;
 
     /// Who or what the table is waiting on when `to_move` is `None` mid-game.
@@ -76,6 +101,17 @@ pub trait Game: 'static {
         ctx: Option<&Ctx>,
     ) -> String;
 
+    /// `render` in a resolved format. Display only: never touches the log.
+    fn render_as(
+        state: &Self::State,
+        names: &[String],
+        me: Option<usize>,
+        ctx: Option<&Ctx>,
+        _format: Format,
+    ) -> String {
+        Self::render(state, names, me, ctx)
+    }
+
     /// The author's own event in words, for `your last move:` (A4).
     /// `None` = a protocol entry, not something a human chose.
     fn recap(before: &Self::State, ev: &Self::Event, names: &[String]) -> Option<String>;
@@ -91,6 +127,55 @@ pub trait Game: 'static {
     fn moment(_before: &Self::State) -> Option<String> {
         None
     }
+}
+
+/// A resolved render format (render formats R3): an id from the game's
+/// `FORMATS`, and whether color escapes are allowed (`NO_COLOR` unset).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Format {
+    pub id: &'static str,
+    pub color: bool,
+}
+
+/// What the seat's shell asked for. The engine resolves it; nothing is stored.
+pub struct FormatPrefs<'a> {
+    pub flag: Option<&'a str>,
+    pub env: Option<&'a str>,
+    pub tty: bool,
+    pub no_color: bool,
+}
+
+/// Exact, ASCII case-insensitive, no trimming, no prefixes (H7). Returns the
+/// game's own `&'static str`, never the caller's text.
+pub fn match_format<G: Game>(id: &str) -> Option<&'static str> {
+    G::FORMATS
+        .iter()
+        .copied()
+        .find(|f| f.eq_ignore_ascii_case(id))
+}
+
+/// `--format` beats `ZEROSUM_FORMAT` beats the game's default. An unknown
+/// flag is an error; an unknown env value silently falls back (a flag is a
+/// request, the env a preference).
+pub fn resolve_format<G: Game>(p: &FormatPrefs) -> Result<Format, String> {
+    let id = match p.flag {
+        Some(f) => match_format::<G>(f).ok_or_else(|| {
+            format!(
+                "{} has no `{}` format ({})",
+                G::ID,
+                escape(f),
+                G::FORMATS.join(", ")
+            )
+        })?,
+        None => p
+            .env
+            .and_then(match_format::<G>)
+            .unwrap_or_else(|| G::default_format(p.tty, p.no_color)),
+    };
+    Ok(Format {
+        id,
+        color: !p.no_color,
+    })
 }
 
 pub struct Ctx {
@@ -191,12 +276,21 @@ pub fn valid_name(n: &str) -> bool {
             .all(|&c| c.is_ascii_alphanumeric() || b" _.-".contains(&c))
 }
 
-/// 2..=8 seats; names match [`valid_name`] and are unique case-insensitively
-/// (register matches names case-insensitively, so `Alice`/`alice` would
-/// deadlock a seat).
-pub fn check_roster(names: &[String]) -> Result<(), String> {
-    if !(2..=MAX_SEATS).contains(&names.len()) {
-        return Err(format!("need 2 to {MAX_SEATS} players"));
+/// `need exactly 2 players` or `need 2 to 8 players`.
+pub fn seat_range_error(seats: &RangeInclusive<usize>) -> String {
+    if seats.start() == seats.end() {
+        format!("need exactly {} players", seats.start())
+    } else {
+        format!("need {} to {} players", seats.start(), seats.end())
+    }
+}
+
+/// The game's seat range; names match [`valid_name`] and are unique
+/// case-insensitively (register matches names case-insensitively, so
+/// `Alice`/`alice` would deadlock a seat).
+pub fn check_roster(names: &[String], seats: RangeInclusive<usize>) -> Result<(), String> {
+    if !seats.contains(&names.len()) {
+        return Err(seat_range_error(&seats));
     }
     for (i, n) in names.iter().enumerate() {
         if !valid_name(n) {
@@ -221,7 +315,7 @@ pub fn new_session<G: Game>(
     names: &[String],
     nonce: [u8; 16],
 ) -> Result<Session, String> {
-    check_roster(names)?;
+    check_roster(names, G::seats())?;
     let genesis = Genesis {
         session_id: sid.to_string(),
         game: G::ID.to_string(),
@@ -325,7 +419,7 @@ fn replay_inner<G: Game>(
     }
     let names: Vec<String> = g.roster.iter().map(|r| r.name.clone()).collect();
     let seats: Vec<String> = g.roster.iter().map(|r| r.seat.clone()).collect();
-    check_roster(&names).or_else(|e| broken(0, e))?;
+    check_roster(&names, G::seats()).or_else(|e| broken(0, e))?;
     let names: Vec<String> = names.iter().map(|n| escape(n)).collect();
     if seats
         .iter()
@@ -531,7 +625,7 @@ fn run_duties<G: Game>(
 
 /// Issue #8's seam, generalized. No I/O, no printing, no entropy of its own.
 /// The legal prefix persists; a turn-ending move halts the chain via the
-/// `to_move` check and a win via the `winner` check.
+/// `may_move` check and a win via the `winner` check.
 pub fn apply_chain<G: Game>(
     s: &mut Session,
     t: &mut Table<G>,
@@ -547,11 +641,7 @@ pub fn apply_chain<G: Game>(
             if G::winner(&t.state).is_some() {
                 return Err("the game is over".to_string());
             }
-            match G::to_move(&t.state) {
-                Some(p) if p == me => {}
-                Some(other) => return Err(format!("it's {}'s turn, not yours", t.names[other])),
-                None => return Err(format!("waiting on {}", G::waiting(&t.state, &t.names))),
-            }
+            G::may_move(&t.state, me, &t.names)?;
             for ev in G::plan(&t.state, me, mv, ctx)? {
                 push_step(s, t, me, ev, sk, &mut steps)?;
             }
@@ -839,15 +929,20 @@ mod tests {
     #[test]
     fn roster_rules_seats_and_names() {
         let names = |v: &[&str]| v.iter().map(|n| n.to_string()).collect::<Vec<_>>();
-        assert!(check_roster(&names(&["Al Ice", "b.o_b-2"])).is_ok());
-        assert!(check_roster(&names(&["Alice", " Bob"])).is_err());
-        assert!(check_roster(&names(&["Alice", "Bob\u{1b}[31m"])).is_err());
-        assert!(check_roster(&names(&["Alice", "Bob;rm"])).is_err());
-        assert!(check_roster(&names(&["Alice", &"x".repeat(25)])).is_err());
-        assert!(check_roster(&names(&["Alice", &"x".repeat(24)])).is_ok());
+        let check = |n: &[String]| check_roster(n, 2..=MAX_SEATS);
+        assert!(check(&names(&["Al Ice", "b.o_b-2"])).is_ok());
+        assert!(check(&names(&["Alice", " Bob"])).is_err());
+        assert!(check(&names(&["Alice", "Bob\u{1b}[31m"])).is_err());
+        assert!(check(&names(&["Alice", "Bob;rm"])).is_err());
+        assert!(check(&names(&["Alice", &"x".repeat(25)])).is_err());
+        assert!(check(&names(&["Alice", &"x".repeat(24)])).is_ok());
         let nine: Vec<String> = (1..=9).map(|i| format!("P{i}")).collect();
-        assert_eq!(check_roster(&nine).unwrap_err(), "need 2 to 8 players");
-        assert!(check_roster(&nine[..8]).is_ok());
+        assert_eq!(check(&nine).unwrap_err(), "need 2 to 8 players");
+        assert!(check(&nine[..8]).is_ok());
+        assert_eq!(
+            check_roster(&nine[..3], 2..=2).unwrap_err(),
+            "need exactly 2 players"
+        );
     }
 
     /// A6/A7 at verify: a doctored genesis is BROKEN, and its text is inert.
@@ -986,14 +1081,47 @@ mod tests {
         );
     }
 
+    /// R3/H7: a flag is matched exactly (ASCII case aside) and an unknown
+    /// one is an error echoed inert; an unknown env value falls back silently.
+    #[test]
+    fn render_formats_resolve_flag_then_env_then_default() {
+        let prefs = |flag, env| FormatPrefs {
+            flag,
+            env,
+            tty: true,
+            no_color: false,
+        };
+        let id = |flag, env| resolve_format::<Farkle>(&prefs(flag, env)).map(|f| f.id);
+        assert_eq!(id(None, None), Ok("default"));
+        assert_eq!(id(Some("DEFAULT"), None), Ok("default"));
+        assert_eq!(id(None, Some("ledger")), Ok("default"));
+        assert_eq!(
+            id(Some("ledger"), Some("default")).unwrap_err(),
+            "farkle has no `ledger` format (default)"
+        );
+        for near in [" default", "default ", "def", ""] {
+            assert!(id(Some(near), None).is_err(), "{near:?}");
+        }
+        assert_eq!(
+            id(Some("x\u{1b}[2J"), None).unwrap_err(),
+            "farkle has no `x\\u{1b}[2J` format (default)"
+        );
+        let f = resolve_format::<Farkle>(&FormatPrefs {
+            no_color: true,
+            ..prefs(None, None)
+        });
+        assert_eq!(f.map(|f| f.color), Ok(false));
+    }
+
     #[test]
     fn roster_names_must_differ_ignoring_case() {
         let names = |v: &[&str]| v.iter().map(|n| n.to_string()).collect::<Vec<_>>();
-        assert!(check_roster(&names(&["Alice", "Bob"])).is_ok());
-        assert!(check_roster(&names(&["Alice", "alice"]))
+        let check = |n: &[String]| check_roster(n, 2..=MAX_SEATS);
+        assert!(check(&names(&["Alice", "Bob"])).is_ok());
+        assert!(check(&names(&["Alice", "alice"]))
             .unwrap_err()
             .contains("names must differ ignoring case"));
-        assert!(check_roster(&names(&["Alice"])).is_err());
-        assert!(check_roster(&names(&["Alice", " "])).is_err());
+        assert!(check(&names(&["Alice"])).is_err());
+        assert!(check(&names(&["Alice", " "])).is_err());
     }
 }

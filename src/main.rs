@@ -7,7 +7,7 @@ mod farkle;
 mod liars_dice;
 mod storage;
 
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::marker::PhantomData;
 
 use clap::{Parser, Subcommand};
@@ -18,7 +18,8 @@ use engine::keys::{self, Password, Secrets};
 use engine::log::Session;
 use engine::{
     append_register, apply_chain, escape, genesis_game, head_line, hw, new_session, replay,
-    replay_narrated, Broken, Chain, Ctx, Game, Table, MAX_SEATS,
+    replay_narrated, resolve_format, seat_range_error, Broken, Chain, Ctx, Format, FormatPrefs,
+    Game, Table,
 };
 use farkle::Farkle;
 use liars_dice::LiarsDice;
@@ -46,11 +47,20 @@ enum Command {
         ruleset: Option<String>,
     },
     /// Claim a seat by name in a session, print that player's password.
-    Register { session_id: String, name: String },
+    Register {
+        session_id: String,
+        name: String,
+        /// Render format for this seat, baked into the printed `zs` hint.
+        #[arg(long)]
+        format: Option<String>,
+    },
     /// Play with the password in ZEROSUM_PASSWORD. No moves = show status.
     /// Farkle: `roll`, `keep <dice...>`, `bank`; moves chain: `keep 5 5 roll`.
     /// Liar's Dice: `bid <qty> <face>`, `liar`, `spot` (one per call).
     Play {
+        /// Render format for this run (overrides ZEROSUM_FORMAT).
+        #[arg(long)]
+        format: Option<String>,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         moves: Vec<String>,
     },
@@ -62,6 +72,43 @@ const PASSWORD_ENV: &str = "ZEROSUM_PASSWORD";
 /// A5: a shell variable passed per command, never exported, so the password
 /// doesn't ride along into every child process's environment.
 const LOAD_HINT: &str = r#"read -rs ZP; zs() { ZEROSUM_PASSWORD="$ZP" 0sum "$@"; }"#;
+const FORMAT_ENV: &str = "ZEROSUM_FORMAT";
+
+/// R3: `--format` baked into the hint as the matched id, never the argv text.
+fn load_hint(format: Option<&str>) -> String {
+    match format {
+        None => LOAD_HINT.to_string(),
+        Some(id) => format!(
+            r#"read -rs ZP; zs() {{ ZEROSUM_PASSWORD="$ZP" {FORMAT_ENV}={id} 0sum "$@"; }}"#
+        ),
+    }
+}
+
+/// The seat's shell, read once. The engine resolves it per game.
+struct Shell {
+    env: Option<String>,
+    tty: bool,
+    no_color: bool,
+}
+
+impl Shell {
+    fn read() -> Shell {
+        Shell {
+            env: std::env::var(FORMAT_ENV).ok().filter(|v| !v.is_empty()),
+            tty: io::stdout().is_terminal(),
+            no_color: std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty()),
+        }
+    }
+
+    fn prefs<'a>(&'a self, flag: Option<&'a str>) -> FormatPrefs<'a> {
+        FormatPrefs {
+            flag,
+            env: self.env.as_deref(),
+            tty: self.tty,
+            no_color: self.no_color,
+        }
+    }
+}
 
 fn main() {
     let cli = Cli::parse();
@@ -69,10 +116,17 @@ fn main() {
     if let Some(w) = store.legacy_index_warning() {
         eprintln!("{w}");
     }
+    let shell = Shell::read();
     let result = store.prepare().and_then(|()| match cli.command {
         Command::New { game, ruleset } => driver(&game)?.create(&store, ruleset.as_deref()),
-        Command::Register { session_id, name } => cmd_register(&store, &session_id, &name),
-        Command::Play { moves } => cmd_play(&store, &moves),
+        Command::Register {
+            session_id,
+            name,
+            format,
+        } => cmd_register(&store, &session_id, &name, &shell.prefs(format.as_deref())),
+        Command::Play { format, moves } => {
+            cmd_play(&store, &moves, &shell.prefs(format.as_deref()))
+        }
         Command::Verify { session_id } => cmd_verify(&store, &session_id),
     });
     if let Err(e) = result {
@@ -83,13 +137,20 @@ fn main() {
 
 trait Driver {
     fn create(&self, store: &Store, ruleset: Option<&str>) -> Result<(), String>;
-    fn register(&self, store: &Store, s: Session, name: &str) -> Result<(), String>;
+    fn register(
+        &self,
+        store: &Store,
+        s: Session,
+        name: &str,
+        prefs: &FormatPrefs,
+    ) -> Result<(), String>;
     fn play(
         &self,
         store: &Store,
         s: Session,
         pw: &Password,
         tokens: &[String],
+        prefs: &FormatPrefs,
     ) -> Result<(), String>;
     fn verify(&self, s: &Session) -> Result<(), String>;
 }
@@ -120,14 +181,14 @@ fn session_driver(s: &Session) -> Result<&'static dyn Driver, String> {
     driver(game)
 }
 
-fn cmd_register(store: &Store, sid: &str, name: &str) -> Result<(), String> {
+fn cmd_register(store: &Store, sid: &str, name: &str, prefs: &FormatPrefs) -> Result<(), String> {
     let sid = keys::parse_sid(sid)?;
     let _lock = store.lock(&sid)?;
     let s = load(store, &sid)?;
-    session_driver(&s)?.register(store, s, name)
+    session_driver(&s)?.register(store, s, name, prefs)
 }
 
-fn cmd_play(store: &Store, tokens: &[String]) -> Result<(), String> {
+fn cmd_play(store: &Store, tokens: &[String], prefs: &FormatPrefs) -> Result<(), String> {
     if tokens.iter().any(|t| keys::looks_like_password(t)) {
         return Err("don't put your password on the command line — it's in your shell history now; use ZEROSUM_PASSWORD".into());
     }
@@ -140,7 +201,7 @@ fn cmd_play(store: &Store, tokens: &[String]) -> Result<(), String> {
     let pw = Password::parse(&raw)?;
     let _lock = store.lock(pw.sid())?;
     let s = load(store, pw.sid())?;
-    session_driver(&s)?.play(store, s, &pw, tokens)
+    session_driver(&s)?.play(store, s, &pw, tokens, prefs)
 }
 
 /// Public and read-only: prints the narrative, then `OK …` or `BROKEN …` (exit 1).
@@ -187,8 +248,8 @@ fn print_steps<G: Game>(chain: &Chain<G>, names: &[String]) -> Vec<String> {
 
 /// The table. A render can open with a block the narration just printed (a
 /// resolved round's result is in both); that block isn't printed twice.
-fn print_status<G: Game>(t: &Table<G>, me: usize, ctx: &Ctx, said: &[String]) {
-    let view = G::render(&t.state, &t.names, Some(me), Some(ctx));
+fn print_status<G: Game>(t: &Table<G>, me: usize, ctx: &Ctx, said: &[String], format: Format) {
+    let view = G::render_as(&t.state, &t.names, Some(me), Some(ctx), format);
     let view = match view.split_once("\n\n") {
         Some((top, rest)) if top.lines().all(|l| said.iter().any(|s| s == l)) => rest,
         _ => &view,
@@ -255,10 +316,19 @@ fn write_mark<G: Game>(
 impl<G: Game> Driver for Engine<G> {
     fn create(&self, store: &Store, ruleset: Option<&str>) -> Result<(), String> {
         let rules = G::ruleset(ruleset.unwrap_or(G::DEFAULT_RULESET))?;
-        let count = prompt_usize("How many players? [2]: ", 2)?;
-        if !(2..=MAX_SEATS).contains(&count) {
-            return Err(format!("need 2 to {MAX_SEATS} players"));
-        }
+        let seats = G::seats();
+        let count = if seats.start() == seats.end() {
+            let title = G::describe(&rules);
+            let title = title.split(',').next().unwrap_or(G::ID);
+            println!("{title} is a {}-player game.", seats.start());
+            *seats.start()
+        } else {
+            let count = prompt_usize("How many players? [2]: ", 2)?;
+            if !seats.contains(&count) {
+                return Err(seat_range_error(&seats));
+            }
+            count
+        };
         let mut names = Vec::new();
         for i in 1..=count {
             let name = prompt_line(&format!("Player {i} name: "))?;
@@ -288,8 +358,15 @@ impl<G: Game> Driver for Engine<G> {
         Ok(())
     }
 
-    fn register(&self, store: &Store, mut s: Session, name: &str) -> Result<(), String> {
+    fn register(
+        &self,
+        store: &Store,
+        mut s: Session,
+        name: &str,
+        prefs: &FormatPrefs,
+    ) -> Result<(), String> {
         let sid = s.session_id.clone();
+        let format = resolve_format::<G>(prefs)?;
         let mut t = replay::<G>(&s).map_err(|b| refuse_broken(&sid, b))?;
         let seat = t
             .names
@@ -333,13 +410,13 @@ impl<G: Game> Driver for Engine<G> {
         println!(
             "Load it into this terminal: run this, paste the password at the silent prompt, Enter."
         );
-        println!("  {LOAD_HINT}");
+        println!("  {}", load_hint(prefs.flag.map(|_| format.id)));
         println!("Then play with `zs play …` (plain `zs play` shows the table).");
         println!();
         let said = print_steps(&chain, &t.names);
         if t.started() {
             println!("All players in.");
-            print_status(&t, seat, &ctx, &said);
+            print_status(&t, seat, &ctx, &said, format);
         } else {
             println!("Waiting on: {}", t.unregistered().join(", "));
         }
@@ -354,8 +431,10 @@ impl<G: Game> Driver for Engine<G> {
         mut s: Session,
         pw: &Password,
         tokens: &[String],
+        prefs: &FormatPrefs,
     ) -> Result<(), String> {
         let sid = s.session_id.clone();
+        let format = resolve_format::<G>(prefs)?;
         let mut t = replay::<G>(&s).map_err(|b| refuse_broken(&sid, b))?;
         let mut ctx = ctx_for(pw);
         let sk = ctx.secrets.signing_key();
@@ -373,7 +452,7 @@ impl<G: Game> Driver for Engine<G> {
         }
         if let Some(line) = G::game_over(&t.state, &t.names) {
             println!("{line}");
-            print_status(&t, me, &ctx, &[]);
+            print_status(&t, me, &ctx, &[], format);
             print_whereabouts(&s, &t, me);
             return Ok(());
         }
@@ -397,7 +476,7 @@ impl<G: Game> Driver for Engine<G> {
         let marked = write_mark(store, &s, &t, me, &sk);
         let said = print_steps(&chain, &t.names);
         if appended || tokens.is_empty() {
-            print_status(&t, me, &ctx, &said);
+            print_status(&t, me, &ctx, &said, format);
         }
         print_whereabouts(&s, &t, me);
         marked?;
@@ -483,7 +562,13 @@ mod tests {
             for tokens in [&["roll"][..], &[], &["bank"], &["yeet"]] {
                 let tokens: Vec<String> = tokens.iter().map(|t| t.to_string()).collect();
                 let loaded = store.load("TEST01").ok().unwrap();
-                assert_eq!(farkle.play(&store, loaded, &pw, &tokens), Ok(()));
+                let prefs = FormatPrefs {
+                    flag: None,
+                    env: None,
+                    tty: false,
+                    no_color: false,
+                };
+                assert_eq!(farkle.play(&store, loaded, &pw, &tokens, &prefs), Ok(()));
             }
         }
         assert_eq!(store.load("TEST01").ok().unwrap().log.len(), s.log.len());
