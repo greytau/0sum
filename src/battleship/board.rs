@@ -1,4 +1,4 @@
-//! Board encodings and geometry (B§2.1, B§10.5). Pure functions shared by
+//! Board encodings and geometry (B§2.1, B§10 item 6). Pure functions shared by
 //! `plan`, `duty`, `fold` and the renderers, so live play and verify run the
 //! same geometry. [`squares`] is the only code that turns a placement into
 //! squares (amendment A1).
@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use super::ruleset::RuleSet;
 use super::Cheat;
+use crate::engine::escape;
 use crate::engine::keys::Secrets;
 use crate::engine::slots::{self, Scope};
 
@@ -133,7 +134,7 @@ fn bounds(rules: &RuleSet) -> String {
     )
 }
 
-/// `^[A-Za-z][0-9]{1,2}$`, row letter < rows, column number - 1 < cols.
+/// Shape only: a letter then 1-2 digits; bounds are parse_square's.
 pub fn looks_like_square(token: &str) -> bool {
     let b = token.as_bytes();
     (2..=3).contains(&b.len())
@@ -142,17 +143,22 @@ pub fn looks_like_square(token: &str) -> bool {
 }
 
 pub fn parse_square(rules: &RuleSet, token: &str) -> Result<(u8, u8), String> {
-    let up = token.to_ascii_uppercase();
     if !looks_like_square(token) {
         return Err(format!(
-            "`{up}` isn't a square ({}, e.g. B5)",
+            "`{}` isn't a square ({}, e.g. B5)",
+            escape(token),
             bounds(rules)
         ));
     }
+    let up = token.to_ascii_uppercase();
     let row = up.as_bytes()[0] - b'A';
     let num: u8 = up[1..].parse().expect("1-2 ascii digits");
     if row >= rules.rows || num == 0 || num > rules.cols {
-        return Err(format!("`{up}` isn't on the board ({})", bounds(rules)));
+        return Err(format!(
+            "`{}` isn't on the board ({})",
+            escape(token),
+            bounds(rules)
+        ));
     }
     Ok((row, num - 1))
 }
@@ -197,7 +203,9 @@ pub fn read_back(
                 for col in 0..rules.cols {
                     for dir in [Dir::H, Dir::V] {
                         let p = Placement { row, col, dir };
-                        if slots::opens(scope, c, k as u16, &salt, &p.enc()) {
+                        if ship_squares(rules, k, p).is_some()
+                            && slots::opens(scope, c, k as u16, &salt, &p.enc())
+                        {
                             return Ok(Some(p));
                         }
                     }
@@ -408,7 +416,7 @@ mod tests {
         assert_eq!(parse_square(&r, "J10"), Ok((9, 9)));
         assert_eq!(
             parse_square(&r, "k1").unwrap_err(),
-            "`K1` isn't on the board (rows A-J, columns 1-10)"
+            "`k1` isn't on the board (rows A-J, columns 1-10)"
         );
         assert!(parse_square(&r, "A11")
             .unwrap_err()

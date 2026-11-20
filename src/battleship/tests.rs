@@ -1056,8 +1056,19 @@ fn a_bent_carrier_forfeits_off_board() {
     ok(&mut g, 0, &format!("{ALICE} ready"));
     rig(&mut g, 1, &fleet, &occ_of(&squares));
     let water = water_of(&ALICE_SHIPS);
-    duel(&mut g, [&bent[..4], &water], &mut honest);
+    let mut by_hand = |st: &State, d: usize| {
+        (d == 1).then(|| {
+            let i = st.pending.unwrap();
+            answer_with(1, i, squares.contains(&i), None)
+        })
+    };
+    duel(&mut g, [&bent[..4], &water], &mut by_hand);
     assert_eq!(g.1.state.boards[1].hits, 4, "every bent square answers hit");
+    assert_eq!(
+        duty_of(&g, 1),
+        None,
+        "Bob's own binary can't read A8 h back"
+    );
     put(&mut g, 0, Event::Shot { cell: 11 }).unwrap();
     put(&mut g, 1, answer_with(1, 11, true, Some((0, h(0, 7))))).unwrap();
     assert_eq!(
@@ -1107,9 +1118,28 @@ fn a_bent_carrier_forfeits_off_board() {
     rig(&mut g, 0, &fleet, &occ_of(&squares));
     ok(&mut g, 1, &format!("{BOB} ready"));
     let water = water_of(&squares);
-    duel(&mut g, [&BOB_SHIPS, &water], &mut honest);
+    let mut by_hand = |st: &State, d: usize| {
+        (d == 0).then(|| {
+            let i = st.pending.unwrap();
+            answer_with(0, i, squares.contains(&i), None)
+        })
+    };
+    duel(&mut g, [&BOB_SHIPS, &water], &mut by_hand);
     assert_eq!(g.1.state.provisional, Some(0));
-    ok(&mut g, 0, "");
+    assert_eq!(
+        duty_of(&g, 0),
+        None,
+        "Alice's own binary can't read A8 h back"
+    );
+    put(
+        &mut g,
+        0,
+        Event::Reveal {
+            b: Hex(seed_of(0)),
+            fleet,
+        },
+    )
+    .unwrap();
     assert_eq!(
         forfeit(&g),
         (
@@ -2029,4 +2059,372 @@ fn the_ledger_alone_is_enough_to_play_to_a_win() {
         ledger_of(&g, l).starts_with("over · enemy won: sank your fleet; enemy's fleet verified\n")
     );
     assert!(narrative(&g.0).last().unwrap().ends_with("fleet verified"));
+}
+
+// ---------------------------------------------------------------- fix round 5
+
+const LOCKED: &str = "your fleet is locked: ships can't move after ready";
+
+/// D1/P1: once locked, `place`, `place auto` and `ready` are refused in
+/// `plan` itself, whatever phase, and append nothing.
+#[test]
+fn a_locked_fleet_refuses_place_and_ready_in_plan() {
+    let mut g = game(RuleSet::classic());
+    ok(&mut g, 0, &format!("{ALICE} ready"));
+    for line in ["place carrier B1 h", "place auto", "ready"] {
+        let mv = &moves(line)[0];
+        let ctx = &mut g.2[0].ctx;
+        assert_eq!(
+            Battleship::plan(&g.1.state, 0, mv, ctx),
+            Err(LOCKED.into()),
+            "{line}"
+        );
+    }
+    let mut g = locked();
+    let before = g.0.log.len();
+    for line in ["place carrier B1 h", "place auto", "ready"] {
+        assert_eq!(fails(&mut g, 0, line), LOCKED, "{line}");
+        assert_eq!(g.0.log.len(), before, "{line} appended");
+    }
+}
+
+/// D2: an own `placed` that runs off the board can't be read back: every
+/// move and every look says so instead of panicking.
+#[test]
+fn an_own_off_board_placement_fails_read_back_cleanly() {
+    let mut g = game(RuleSet::classic());
+    let scope = board::ship_scope(&g.1.state.sid, seat(0));
+    let c = Hex(board::ship_commitment(&scope, &seed_of(0), 0, h(0, 7)));
+    put(&mut g, 0, Event::Placed { ship: 0, c }).unwrap();
+    let why = "can't read your carrier back from the log with this password";
+    for line in ["place battleship C1 h", "place auto", "ready"] {
+        assert_eq!(fails(&mut g, 0, line), why, "{line}");
+    }
+    for id in Battleship::FORMATS {
+        assert!(
+            draw(&g, 0, id, false).contains(&format!("error: {why}")),
+            "{id}"
+        );
+    }
+}
+
+/// Alice fires `cell`, Bob answers with `bob_answer`, Bob fires `bob_shot`,
+/// Alice answers honestly.
+fn hp_round(g: &mut Seated, cell: u16, bob_answer: Event, bob_shot: u16) {
+    put(g, 0, Event::Shot { cell }).unwrap();
+    put(g, 1, bob_answer).unwrap();
+    if g.1.state.phase != Phase::Battle {
+        return;
+    }
+    put(g, 1, Event::Shot { cell: bob_shot }).unwrap();
+    let d = duty_of(g, 0).unwrap();
+    put(g, 0, d).unwrap();
+}
+
+/// Bob's cruiser rigged onto A2-A4, over the destroyer's A2.
+fn overlapping_bob() -> (Vec<Placement>, Vec<u16>) {
+    let mut fleet = bob_fleet();
+    fleet[2] = h(0, 1);
+    let mut sq: Vec<u16> = BOB_SHIPS
+        .iter()
+        .copied()
+        .filter(|i| ![5, 15, 25].contains(i))
+        .collect();
+    sq.extend([2, 3]);
+    (fleet, sq)
+}
+
+#[test]
+fn a_sunk_overlapping_an_earlier_sunk_forfeits() {
+    let mut g = game(RuleSet::classic());
+    ok(&mut g, 0, &format!("{ALICE} ready"));
+    let (fleet, sq) = overlapping_bob();
+    rig(&mut g, 1, &fleet, &occ_of(&sq));
+    let w = water_of(&ALICE_SHIPS);
+    hp_round(&mut g, 0, answer_with(1, 0, true, None), w[0]);
+    hp_round(&mut g, 1, answer_with(1, 1, true, Some((4, h(0, 0)))), w[1]);
+    hp_round(&mut g, 2, answer_with(1, 2, true, None), w[2]);
+    hp_round(&mut g, 3, answer_with(1, 3, true, Some((2, h(0, 1)))), w[3]);
+    assert_eq!(
+        forfeit(&g),
+        (
+            0,
+            1,
+            Cheat::Overlap {
+                ship: 2,
+                other: 4,
+                cell: 1
+            }
+        )
+    );
+}
+
+#[test]
+fn a_sunk_touching_an_earlier_sunk_forfeits_under_notouch() {
+    let mut g = game(RuleSet::notouch());
+    ok(&mut g, 0, &format!("{ALICE} ready"));
+    let mut fleet = bob_fleet();
+    fleet[3] = h(1, 0);
+    let mut sq: Vec<u16> = BOB_SHIPS
+        .iter()
+        .copied()
+        .filter(|i| ![47, 57, 67].contains(i))
+        .collect();
+    sq.extend([10, 11, 12]);
+    rig(&mut g, 1, &fleet, &occ_of(&sq));
+    let w = water_of(&ALICE_SHIPS);
+    hp_round(&mut g, 0, answer_with(1, 0, true, None), w[0]);
+    hp_round(&mut g, 1, answer_with(1, 1, true, Some((4, h(0, 0)))), w[1]);
+    hp_round(&mut g, 10, answer_with(1, 10, true, None), w[2]);
+    hp_round(&mut g, 11, answer_with(1, 11, true, None), w[3]);
+    hp_round(
+        &mut g,
+        12,
+        answer_with(1, 12, true, Some((3, h(1, 0)))),
+        w[4],
+    );
+    assert_eq!(forfeit(&g), (0, 1, Cheat::Touching { ship: 3, other: 4 }));
+}
+
+/// Cheater vs cheater: Bob's overlap at a sunk comes first in the log, so Bob
+/// forfeits even though Alice's board is rigged too (she'd forfeit at her reveal).
+#[test]
+fn the_first_proven_lie_decides() {
+    let mut g = game(RuleSet::classic());
+    let mut asq = ALICE_SHIPS.to_vec();
+    asq.retain(|&i| i != 0);
+    rig(&mut g, 0, &alice_fleet(), &occ_of(&asq));
+    let (fleet, sq) = overlapping_bob();
+    rig(&mut g, 1, &fleet, &occ_of(&sq));
+    let w = water_of(&ALICE_SHIPS);
+    for (k, (cell, ans)) in [
+        (0u16, answer_with(1, 0, true, None)),
+        (1, answer_with(1, 1, true, Some((4, h(0, 0))))),
+        (2, answer_with(1, 2, true, None)),
+        (3, answer_with(1, 3, true, Some((2, h(0, 1))))),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        put(&mut g, 0, Event::Shot { cell }).unwrap();
+        put(&mut g, 1, ans).unwrap();
+        if g.1.state.phase != Phase::Battle {
+            break;
+        }
+        put(&mut g, 1, Event::Shot { cell: w[k] }).unwrap();
+        let i = g.1.state.pending.unwrap();
+        put(&mut g, 0, answer_with(0, i, asq.contains(&i), None)).unwrap();
+    }
+    assert_eq!(forfeit(&g).1, 1, "Bob's earlier lie decides");
+}
+
+/// Columns as Pixie measured the mockup: East-Asian wide and fullwidth
+/// characters count 2, everything else 1.
+fn display_width(s: &str) -> usize {
+    s.chars()
+        .map(|c| match c as u32 {
+            0x1100..=0x115F
+            | 0x2E80..=0x303E
+            | 0x3041..=0x33FF
+            | 0x3400..=0x4DBF
+            | 0x4E00..=0x9FFF
+            | 0xA000..=0xA4CF
+            | 0xAC00..=0xD7A3
+            | 0xF900..=0xFAFF
+            | 0xFE30..=0xFE4F
+            | 0xFF00..=0xFF60
+            | 0xFFE0..=0xFFE6
+            | 0x1F300..=0x1F64F
+            | 0x1F900..=0x1F9FF
+            | 0x20000..=0x3FFFD => 2,
+            _ => 1,
+        })
+        .sum()
+}
+
+/// Paige saw 79 columns while placing and 76 after `place auto`: every
+/// bridge, every phase, both seats, short and 24-letter names, is look-3's 78.
+#[test]
+fn every_bridge_is_exactly_the_mockups_width() {
+    let mockup_w = look("bridge.txt").lines().map(display_width).max().unwrap();
+    assert_eq!(mockup_w, 78);
+    let mut seen: Vec<(String, Vec<usize>)> = Vec::new();
+    let mut measure = |label: &str, g: &Seated, ctx_of: [usize; 2]| {
+        for (s, &c) in ctx_of.iter().enumerate() {
+            let ctx = &g.2[c].ctx;
+            for color in [false, true] {
+                let text = Battleship::render_as(
+                    &g.1.state,
+                    &g.1.names,
+                    Some(s),
+                    Some(ctx),
+                    Format {
+                        id: "bridge",
+                        color,
+                    },
+                );
+                let text = strip_ansi(&text);
+                let widths: Vec<usize> = text.lines().map(display_width).collect();
+                assert!(widths.iter().all(|&w| w == mockup_w), "{label}:\n{text}");
+                match seen.iter_mut().find(|(l, _)| l == label) {
+                    Some((_, w)) => w.extend(widths),
+                    None => seen.push((label.into(), widths)),
+                }
+            }
+        }
+    };
+    for names in [
+        ["Alice", "Bob"],
+        ["Abcdefghijklmnopqrstuvwx", "Zyxwvutsrqponmlkjihgfedc"],
+    ] {
+        let mut g = seated::<Battleship>(&RuleSet::classic(), &names);
+        measure("placing", &g, [0, 1]);
+        ok(&mut g, 0, "place carrier A2 h");
+        measure("placing", &g, [0, 1]);
+        measure("error", &g, [1, 0]);
+        ok(&mut g, 0, "place auto");
+        measure("placing", &g, [0, 1]);
+        ok(&mut g, 0, "ready");
+        measure("placing", &g, [0, 1]);
+        ok(&mut g, 1, &format!("{BOB} ready"));
+        measure("battle", &g, [0, 1]);
+        measure("error", &g, [1, 0]);
+        let water = water_of(&ALICE_SHIPS);
+        duel(&mut g, [&BOB_SHIPS[..8], &water[..8]], &mut honest);
+        measure("battle", &g, [0, 1]);
+        put(&mut g, 0, Event::Shot { cell: BOB_SHIPS[8] }).unwrap();
+        measure("battle", &g, [0, 1]);
+        let mut over: Seated = (
+            g.0.clone(),
+            replay(&g.0).unwrap(),
+            vec![player(0), player(1)],
+        );
+        duel(&mut g, [&BOB_SHIPS[9..], &water[8..]], &mut honest);
+        assert_eq!(g.1.state.phase, Phase::Reveal);
+        measure("reveal", &g, [0, 1]);
+        ok(&mut g, 0, "");
+        measure("over", &g, [0, 1]);
+        put(
+            &mut over,
+            1,
+            answer_with(1, BOB_SHIPS[8], true, Some((0, v(2, 2)))),
+        )
+        .unwrap();
+        assert!(matches!(over.1.state.phase, Phase::Over));
+        measure("over", &over, [0, 1]);
+    }
+    for (label, widths) in &seen {
+        assert!(widths.iter().all(|&w| w == 78), "{label}: {widths:?}");
+    }
+    assert_eq!(seen.len(), 5);
+}
+
+/// Alice's view at Alice's turn with `marks` painted onto her target board:
+/// `X` hit, `o` miss, `=` sunk; `last` is her latest shot.
+fn aiming(marks: &[(&str, char)], sunk: &[(usize, Placement)], last: &str) -> View {
+    let g = locked();
+    let mut v = view(&g.1.state, Some(0), Some(&g.2[0].ctx));
+    let sq = |s: &str| {
+        let (r, c) = board::parse_square(&RuleSet::classic(), s).unwrap();
+        r as u16 * 10 + c as u16
+    };
+    for &(s, m) in marks {
+        v.target[sq(s) as usize] = match m {
+            'X' => TargetSquare::Hit,
+            'o' => TargetSquare::Miss,
+            _ => unreachable!(),
+        };
+    }
+    for &(k, p) in sunk {
+        v.fleets[1].sunk[k] = Some(p);
+        for (t, i) in board::ship_squares(&RuleSet::classic(), k, p)
+            .unwrap()
+            .into_iter()
+            .enumerate()
+        {
+            v.target[i as usize] = TargetSquare::Sunk(draw::ShipPart {
+                ship: k as u8,
+                part: t as u8,
+                dir: p.dir,
+            });
+        }
+    }
+    v.last_mine = Some(ShotView {
+        cell: sq(last),
+        result: Some((true, None)),
+    });
+    v
+}
+
+fn named(v: &View) -> String {
+    board::sq_name(10, v.suggestion().expect("a suggestion"))
+}
+
+/// D3/P2: the `e.g.` extends a line of hits, works from the latest hit, and
+/// never names a square no afloat ship could cover.
+#[test]
+fn the_hint_square_follows_the_hits() {
+    let line = [("F4", 'X'), ("G4", 'X'), ("H4", 'X')];
+    for last in ["F4", "G4", "H4"] {
+        let s = named(&aiming(&line, &[], last));
+        assert!(["E4", "I4"].contains(&s.as_str()), "after {last}: {s}");
+    }
+    let mut blocked = line.to_vec();
+    blocked.extend([("E4", 'o'), ("I4", 'o')]);
+    let s = named(&aiming(&blocked, &[], "H4"));
+    assert!(!["E4", "I4"].contains(&s.as_str()), "{s}");
+
+    assert_eq!(named(&aiming(&[("B2", 'X'), ("H8", 'X')], &[], "B2")), "B3");
+    assert_eq!(named(&aiming(&[("B2", 'X'), ("H8", 'X')], &[], "H8")), "H9");
+
+    // Only ships of 3+ afloat; D9, D6, C7 and E7 missed: nothing 3 long fits through D7.
+    let hole = [
+        ("D8", 'X'),
+        ("D9", 'o'),
+        ("D6", 'o'),
+        ("C7", 'o'),
+        ("E7", 'o'),
+    ];
+    let s = named(&aiming(&hole, &[(4, h(0, 0))], "D8"));
+    assert!(["C8", "E8"].contains(&s.as_str()), "{s}");
+    // Control: with the destroyer afloat, D7 is fair game again.
+    assert_eq!(named(&aiming(&hole, &[], "D8")), "D7");
+}
+
+/// P4: move errors quote argv as typed, escaped, never uppercased.
+#[test]
+fn move_errors_echo_tokens_escaped_and_as_typed() {
+    let rules = RuleSet::classic();
+    assert_eq!(
+        board::parse_square(&rules, "fire"),
+        Err("`fire` isn't a square (rows A-J, columns 1-10, e.g. B5)".into())
+    );
+    assert_eq!(
+        board::parse_square(&rules, "k1"),
+        Err("`k1` isn't on the board (rows A-J, columns 1-10)".into())
+    );
+    assert_eq!(
+        board::parse_square(&rules, "\x1b[2J"),
+        Err(r"`\u{1b}[2J` isn't a square (rows A-J, columns 1-10, e.g. B5)".into())
+    );
+    assert_eq!(
+        Battleship::parse_moves(&tokens("\x1b]0;x\x07")),
+        Err(format!(
+            r"unknown move `\u{{1b}}]0;x\u{{7}}` ({MOVES_HINT})"
+        ))
+    );
+    let mut g = locked();
+    assert_eq!(
+        fails(&mut g, 0, "fire fire"),
+        "`fire` isn't a square (rows A-J, columns 1-10, e.g. B5)"
+    );
+    let mut g = game(rules);
+    assert_eq!(
+        fails(&mut g, 0, "place Cr\x1bx A1 h"),
+        r"unknown ship `Cr\u{1b}x` (carrier, battleship, cruiser, submarine, destroyer)"
+    );
+    assert_eq!(
+        fails(&mut g, 0, "place C A1 h"),
+        "`C` could be carrier or cruiser — type more letters"
+    );
 }

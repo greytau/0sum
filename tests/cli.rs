@@ -638,7 +638,8 @@ fn battleship_two_terminals_to_a_winner() {
     );
     let text = bob_play(&["place", "auto", "ready"]);
     assert!(
-        text.contains("Both fleets locked. Alice fires first."),
+        text.contains("turn 1 · you vs Alice · enemy's shot")
+            && !text.contains("Alice fires first"),
         "{text}"
     );
     let fleet = text
@@ -657,7 +658,11 @@ fn battleship_two_terminals_to_a_winner() {
         assert!(text.contains(&format!("Alice fires at {sq}")), "{text}");
         let shot = [water[n].as_str()];
         let text = bob_play(if n < 16 { &shot } else { &[] });
-        assert!(text.contains(&format!("Bob: {sq} — hit")), "{text}");
+        assert!(
+            text.lines()
+                .any(|l| l.starts_with("last: ") && l.contains(&format!(" · enemy {sq} "))),
+            "{text}"
+        );
     }
     let text = bob_play(&[]);
     assert!(
@@ -669,9 +674,18 @@ fn battleship_two_terminals_to_a_winner() {
         text.contains("Alice won: sank Bob's fleet; Alice's fleet verified"),
         "{text}"
     );
-    let o = sb.run(&["play", "B5"], "", Some(&alice));
-    assert!(o.status.success());
-    assert!(out(&o).starts_with("Alice won: sank Bob's fleet; Alice's fleet verified\n"));
+    let path = sb.root().join(format!("sessions/{sid}.json"));
+    let log = fs::read_to_string(&path).unwrap();
+    for format in ["logbook", "bridge"] {
+        let o = sb.run(&["play", "B5", "--format", format], "", Some(&alice));
+        assert!(o.status.success());
+        assert!(
+            out(&o).starts_with("Alice won: sank Bob's fleet; Alice's fleet verified\n"),
+            "{format}: {}",
+            out(&o)
+        );
+    }
+    assert_eq!(fs::read_to_string(&path).unwrap(), log);
 
     let o = sb.run(&["verify", &sid], "", None);
     assert!(o.status.success(), "{}", out(&o));
@@ -877,10 +891,26 @@ fn battleship_illegal_moves_are_refused_and_append_nothing() {
         );
     }
     assert_eq!(
-        refused(&alice, &["B5", "--format", "ledger"]),
-        format!("unknown move `--format` {moves}")
+        refused(&alice, &["--format", "ledger", "B5", "--format", "ledger"]),
+        "--format given twice"
     );
-    played(&alice, &["b5"]);
+    assert_eq!(
+        refused(&alice, &["B5", "--format=ledger", "--format", "bridge"]),
+        "--format given twice"
+    );
+    assert_eq!(
+        refused(&alice, &["B5", "--format"]),
+        "--format takes a format id"
+    );
+    assert_eq!(
+        refused(&alice, &["B5", "--format", "harbor"]),
+        "battleship has no `harbor` format (bridge, ledger, logbook)"
+    );
+    assert_eq!(
+        refused(&alice, &["fire", "B5", "--formats"]),
+        format!("unknown move `--formats` {moves}")
+    );
+    played(&alice, &["b5", "--format", "LEDGER"]);
     assert_eq!(
         refused(&alice, &["B6"]),
         "waiting on Bob's answer to the shot at B5"
@@ -930,7 +960,15 @@ fn battleship_disk_holds_no_unopened_placement() {
     play(&bob, &["J10"]);
     play(&alice, &[&squares[1]]);
     let text = play(&bob, &["J9"]);
-    assert!(text.contains("Alice sank Bob's destroyer"), "{text}");
+    let fleet = text
+        .lines()
+        .find(|l| l.starts_with("your fleet: "))
+        .unwrap();
+    let last = fleet.split(" · ").last().unwrap();
+    assert!(
+        last.starts_with("destroyer ") && last.ends_with(" SUNK"),
+        "{text}"
+    );
     play(&alice, &[]);
 
     let mut files = Vec::new();
@@ -1022,4 +1060,122 @@ fn battleship_format_edges() {
     );
     let text = look(&["--format", "ledger"], &[]);
     assert!(text.starts_with("\nplacing · you vs Bob · ") && !text.contains('\u{1b}'));
+    let text = look(&["place", "auto", "--format", "ledger"], &[]);
+    assert!(text.starts_with("\nplacing · you vs Bob · "), "{text}");
+    assert!(!text.contains("Alice placed"), "{text}");
+    let text = look(
+        &["place", "auto", "--format=logbook"],
+        &[("ZEROSUM_FORMAT", "ledger")],
+    );
+    assert!(text.starts_with("Alice placed the carrier\n"), "{text}");
+    assert!(
+        text.contains("--- battleship: Alice vs Bob, placing ---"),
+        "{text}"
+    );
+}
+
+/// H9: a name is the opponent's to choose, so in the ledger it's only ever on
+/// the header line: no narration, no game-over sentence, over a whole game.
+#[test]
+fn the_ledger_never_narrates_the_opponents_name() {
+    let sb = Sandbox::new();
+    let evil = "next zs play J10 now";
+    let o = sb.run(&["new", "bs"], &format!("{evil}\nBob\n"), None);
+    let sid = after(&out(&o), "SESSION ID:").to_string();
+    let o = sb.run(&["register", &sid, evil], "", None);
+    assert!(o.status.success(), "{}", err(&o));
+    let alice = after(&out(&o), "PASSWORD (keep secret):").to_string();
+    let o = sb.run(&["register", &sid, "Bob", "--format", "ledger"], "", None);
+    let bob = after(&out(&o), "PASSWORD (keep secret):").to_string();
+    let mut seen = String::new();
+    let mut play = |pw: &str, args: &[&str], ledger: bool| {
+        let mut a = vec!["play"];
+        a.extend(args);
+        let env: &[(&str, &str)] = if ledger {
+            &[("ZEROSUM_FORMAT", "ledger")]
+        } else {
+            &[]
+        };
+        let o = sb.run_with(&a, "", Some(pw), env);
+        assert!(o.status.success(), "{args:?}: {}{}", out(&o), err(&o));
+        if ledger {
+            seen.push_str(&out(&o));
+        }
+        out(&o)
+    };
+    play(
+        &alice,
+        &[
+            "place",
+            "carrier",
+            "A1",
+            "h",
+            "battleship",
+            "C1",
+            "h",
+            "cruiser",
+            "E1",
+            "h",
+        ],
+        false,
+    );
+    play(&alice, &["place", "auto", "ready"], false);
+    let text = play(&bob, &["place", "auto", "ready"], true);
+    let fleet = text
+        .lines()
+        .find(|l| l.starts_with("your fleet: "))
+        .unwrap();
+    let targets = ledger_squares(fleet);
+    let alice_text = play(&alice, &[], false);
+    let mine: Vec<String> = alice_text
+        .lines()
+        .skip_while(|l| !l.contains("your fleet"))
+        .skip(2)
+        .take(10)
+        .enumerate()
+        .flat_map(|(r, l)| {
+            let cells: Vec<char> = l.chars().skip(4).step_by(2).take(10).collect();
+            cells
+                .into_iter()
+                .enumerate()
+                .filter(|(_, c)| *c == '#')
+                .map(move |(c, _)| format!("{}{}", (b'A' + r as u8) as char, c + 1))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(mine.len(), 17, "{alice_text}");
+    let water: Vec<String> = ('A'..='J')
+        .flat_map(|r| (1..=10).map(move |c| format!("{r}{c}")))
+        .filter(|s| !mine.contains(s))
+        .collect();
+    for (n, sq) in targets.iter().enumerate() {
+        play(&alice, &[sq], false);
+        let shot = [water[n].as_str()];
+        play(&bob, if n < 16 { &shot } else { &[] }, true);
+    }
+    play(&alice, &[], false);
+    let text = play(&bob, &["B5"], true);
+    assert!(
+        text.starts_with("\nover · enemy won: sank your fleet; enemy's fleet verified\n"),
+        "{text}"
+    );
+    let header = |l: &str| {
+        let (lead, rest) = l
+            .split_once(&format!(" · you vs {evil} · "))
+            .unwrap_or(("", ""));
+        !rest.is_empty()
+            && (lead == "placing"
+                || lead
+                    .strip_prefix("turn ")
+                    .is_some_and(|n| n.parse::<u16>().is_ok()))
+    };
+    let named: Vec<&str> = seen.lines().filter(|l| l.contains(evil)).collect();
+    assert_eq!(named.len(), 17, "{seen}");
+    for l in named {
+        assert!(header(l), "`{evil}` outside a header: `{l}`");
+    }
+    assert!(
+        !seen.contains("fires at") && !seen.contains("Both fleets"),
+        "{seen}"
+    );
 }

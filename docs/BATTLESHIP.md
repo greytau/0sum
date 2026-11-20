@@ -442,7 +442,7 @@ Anything in `Over` → `Err("the game is over")`.
 
 1. Record `shots[i] = Some(hit)`; bump `hits` or `misses`; fill in the `ShotRecord`.
 2. If `sunk = Some{k, at}`, apply these in order, and the first that applies decides
-   (squares come from `board::squares`, B§10.5; a sunk on a miss lands here too, as
+   (squares come from `board::squares`, B§10 item 6; a sunk on a miss lands here too, as
    `SunkEarly` when shot `i` is on `at`, since `shots[i] = Some(false)`, else `SunkLate`):
    `at` off the board → Forfeit(a, `OffBoard{k}`) ·
    some square `j` of `at` with `shots[j] != Some(true)` → Forfeit(a, `SunkEarly{k, j}`) ·
@@ -458,7 +458,7 @@ Anything in `Over` → `Err("the game is over")`.
 ### B§6.4 Reveal effect, in order
 
 With the board recovered from `b` (`occ_i` for every square, `fleet[k]` for every ship; squares
-from `board::squares`, B§10.5): `OffBoard` (each `k` in order) → `Overlap` (pairs in index order, report the lowest shared
+from `board::squares`, B§10 item 6): `OffBoard` (each `k` in order) → `Overlap` (pairs in index order, report the lowest shared
 square) → `Touching` if `!touching` → for each square `i` in order: `Phantom{i}` if
 `occ_i = 1` and no ship covers it, `Hidden{k, i}` if ship `k` covers it and `occ_i = 0` →
 `Withheld{k}` for the first undeclared ship whose squares all have `shots == Some(true)`.

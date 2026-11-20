@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::engine::log::{Hex, Hex32};
 use crate::engine::slots;
-use crate::engine::{Ctx, Format, Game, SessionInfo};
+use crate::engine::{escape, Ctx, Format, Game, SessionInfo};
 use board::{Dir, Placement, CELL, SHIP};
 use draw::{
     HowView, Incoming, OwnSquare, OwnView, ShipPart, ShotView, SideStatus, TargetSquare, View,
@@ -366,11 +366,16 @@ fn resolve_ship(rules: &RuleSet, token: &str) -> Result<usize, String> {
     let names: Vec<&str> = rules.fleet.iter().map(|s| s.name.as_str()).collect();
     match hits[..] {
         [k] => Ok(k),
-        [] => Err(format!("unknown ship `{token}` ({})", names.join(", "))),
+        [] => Err(format!(
+            "unknown ship `{}` ({})",
+            escape(token),
+            names.join(", ")
+        )),
         _ => {
             let could: Vec<&str> = hits.iter().map(|&k| names[k]).collect();
             Err(format!(
-                "`{token}` could be {} — type more letters",
+                "`{}` could be {} — type more letters",
+                escape(token),
                 could.join(" or ")
             ))
         }
@@ -557,7 +562,7 @@ impl Game for Battleship {
                         return Err(PLACE_USAGE.into());
                     }
                 }
-                None => return Err(format!("unknown move `{token}` ({MOVES_HINT})")),
+                None => return Err(format!("unknown move `{}` ({MOVES_HINT})", escape(token))),
             }
         }
         if moves.is_empty() {
@@ -798,6 +803,9 @@ impl Game for Battleship {
         let b = board::seed(&ctx.secrets);
         match mv {
             Move::Place { ship, square, dir } => {
+                if st.locked(me) {
+                    return Err("your fleet is locked: ships can't move after ready".into());
+                }
                 let k = resolve_ship(rules, ship)?;
                 let (row, col) = board::parse_square(rules, square)?;
                 let p = Placement {
@@ -810,6 +818,9 @@ impl Game for Battleship {
                 Ok(vec![placed_event(st, me, &b, k, p)])
             }
             Move::PlaceAuto => {
+                if st.locked(me) {
+                    return Err("your fleet is locked: ships can't move after ready".into());
+                }
                 let cur = read_own(st, me, &b)?;
                 let fleet = board::auto(rules, &cur, &mut ctx.rng)?;
                 let reroll = cur.iter().all(Option::is_some);
@@ -821,6 +832,9 @@ impl Game for Battleship {
                     .collect())
             }
             Move::Ready => {
+                if st.locked(me) {
+                    return Err("your fleet is locked: ships can't move after ready".into());
+                }
                 let cur = read_own(st, me, &b)?;
                 let missing: Vec<&str> = (0..cur.len())
                     .filter(|&k| cur[k].is_none())

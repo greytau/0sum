@@ -187,23 +187,94 @@ impl View {
             .collect()
     }
 
-    /// An unshot square for the `e.g.`: next to an open hit if there is one.
-    fn suggestion(&self) -> Option<u16> {
-        let cols = self.cols as i32;
-        let unknown = |r: i32, c: i32| {
-            (0..self.rows as i32).contains(&r)
-                && (0..cols).contains(&c)
-                && self.target[(r * cols + c) as usize] == TargetSquare::Unknown
+    /// Whether some afloat enemy ship could lie across `i`, given my misses,
+    /// the sunk ships (and, under notouch, their neighbours) and the edges.
+    fn coverable(&self, i: u16) -> bool {
+        let sunk: Vec<Vec<u16>> = self.fleets[1]
+            .sunk
+            .iter()
+            .enumerate()
+            .filter_map(|(k, p)| p.map(|p| self.squares_of(k, p)))
+            .collect();
+        let (r, c) = ((i / self.cols as u16) as u8, (i % self.cols as u16) as u8);
+        let fits = |len: u8, p: Placement| {
+            board::squares(self.rows, self.cols, p, len).is_some_and(|sq| {
+                sq.iter().all(|&j| {
+                    matches!(
+                        self.target[j as usize],
+                        TargetSquare::Unknown | TargetSquare::Pending | TargetSquare::Hit
+                    )
+                }) && (self.touching || sunk.iter().all(|o| !board::adjacent(self.cols, &sq, o)))
+            })
         };
-        for &i in self.open_hits().iter().rev() {
+        (0..self.fleet.len())
+            .filter(|&k| self.fleets[1].sunk[k].is_none())
+            .any(|k| {
+                let len = self.fleet[k].1;
+                (0..len).any(|t| {
+                    let across = c.checked_sub(t).map(|col| Placement {
+                        row: r,
+                        col,
+                        dir: Dir::H,
+                    });
+                    let down = r.checked_sub(t).map(|row| Placement {
+                        row,
+                        col: c,
+                        dir: Dir::V,
+                    });
+                    [across, down].into_iter().flatten().any(|p| fits(len, p))
+                })
+            })
+    }
+
+    /// An unshot square for the `e.g.`: past either end of a line of open
+    /// hits, else next to the latest open hit, else the first square a ship
+    /// could still be on. Never one no afloat ship could cover.
+    pub(super) fn suggestion(&self) -> Option<u16> {
+        let (rows, cols) = (self.rows as i32, self.cols as i32);
+        let at = |r: i32, c: i32| {
+            ((0..rows).contains(&r) && (0..cols).contains(&c)).then(|| (r * cols + c) as u16)
+        };
+        let hit = |r, c| at(r, c).is_some_and(|i| self.target[i as usize] == TargetSquare::Hit);
+        let open = |r, c| {
+            at(r, c)
+                .filter(|&i| self.target[i as usize] == TargetSquare::Unknown && self.coverable(i))
+        };
+        let mut hits = self.open_hits();
+        hits.reverse();
+        if let Some(i) = self.last_mine.map(|s| s.cell).filter(|i| hits.contains(i)) {
+            hits.retain(|&j| j != i);
+            hits.insert(0, i);
+        }
+        for &i in &hits {
             let (r, c) = (i as i32 / cols, i as i32 % cols);
-            for (dr, dc) in [(0, 1), (0, -1), (1, 0), (-1, 0)] {
-                if unknown(r + dr, c + dc) {
-                    return Some(((r + dr) * cols + c + dc) as u16);
+            for (dr, dc) in [(0, 1), (1, 0)] {
+                let run = |sign: i32| {
+                    (1..)
+                        .take_while(|&n| hit(r + sign * n * dr, c + sign * n * dc))
+                        .count() as i32
+                };
+                let (hi, lo) = (run(1), run(-1));
+                if hi + lo == 0 {
+                    continue;
+                }
+                for n in [hi + 1, -(lo + 1)] {
+                    if let Some(j) = open(r + n * dr, c + n * dc) {
+                        return Some(j);
+                    }
                 }
             }
         }
-        (0..self.cells()).find(|&i| self.target[i as usize] == TargetSquare::Unknown)
+        for &i in &hits {
+            let (r, c) = (i as i32 / cols, i as i32 % cols);
+            for (dr, dc) in [(0, 1), (0, -1), (1, 0), (-1, 0)] {
+                if let Some(j) = open(r + dr, c + dc) {
+                    return Some(j);
+                }
+            }
+        }
+        (0..self.cells())
+            .find(|&i| self.target[i as usize] == TargetSquare::Unknown && self.coverable(i))
     }
 
     /// The first legal spot for ship `k` among my placed ships, for the `e.g.`.
@@ -690,6 +761,13 @@ const SUNK: &str = "38;5;160";
 const PENDING: &str = "1;38;5;220";
 const BOLD: &str = "1";
 
+/// The frame's fixed width (look-3), its inside, and the two board columns.
+const WIDTH: usize = 78;
+const INNER: usize = WIDTH - 3;
+const LEFT_W: usize = 37;
+const RIGHT_W: usize = INNER - LEFT_W;
+const AFLOAT_AT: usize = 46;
+
 /// Text with its visible width, so padding ignores escapes.
 #[derive(Default, Clone)]
 struct Span {
@@ -826,16 +904,21 @@ pub fn draw_bridge(v: &View, names: &[String], color: bool) -> String {
                 None => {}
             }
         }
-        if let Some(t) = side.get_mut(v.fleet.len() + 1) {
-            t.push(&format!(
-                "{opp}: placed {opponent_placed} of {}, {}",
-                v.fleet.len(),
-                if *opponent_locked {
-                    "locked"
-                } else {
-                    "not locked"
-                }
-            ));
+        let theirs = format!(
+            "{opp}: placed {opponent_placed} of {}, {}",
+            v.fleet.len(),
+            if *opponent_locked {
+                "locked"
+            } else {
+                "not locked"
+            }
+        );
+        for (t, l) in side
+            .iter_mut()
+            .skip(v.fleet.len() + 1)
+            .zip(wrap(&theirs, RIGHT_W - 1))
+        {
+            t.push(&l);
         }
         for r in 0..v.rows {
             lines.push(Line::Split(
@@ -845,9 +928,9 @@ pub fn draw_bridge(v: &View, names: &[String], color: bool) -> String {
         }
         lines.push(Line::Rule);
         for h in placing_hints(v, opp) {
-            lines.push(Line::Full(text(&format!("▸ {h}"))));
+            full(&mut lines, &format!("▸ {h}"));
         }
-        lines.push(Line::Full(legend(color, false, None)));
+        lines.push(Line::Full(legend(color, false)));
     } else {
         for r in 0..v.rows {
             lines.push(Line::Split(
@@ -905,48 +988,50 @@ pub fn draw_bridge(v: &View, names: &[String], color: bool) -> String {
                 None => format!("◂ {opp} fired {} — waiting on you", v.sq(s.cell)),
             },
         };
-        lines.push(Line::Split(text(&mine_line), text(&theirs_line)));
+        if mine_line.chars().count() + 2 <= LEFT_W && theirs_line.chars().count() < RIGHT_W {
+            lines.push(Line::Split(text(&mine_line), text(&theirs_line)));
+        } else {
+            full(&mut lines, &mine_line);
+            full(&mut lines, &theirs_line);
+        }
         let n = v.fleet.len();
         let afloat = format!(
             "afloat  you {}/{n} · {opp} {}/{n}",
             v.afloat(0),
             v.afloat(1)
         );
-        lines.push(Line::Full(legend(color, true, Some(&afloat))));
+        let mut key = legend(color, true);
+        if AFLOAT_AT + afloat.chars().count() < INNER {
+            key.pad(AFLOAT_AT).push(&afloat);
+            lines.push(Line::Full(key));
+        } else {
+            lines.push(Line::Full(key));
+            full(&mut lines, &afloat);
+        }
     }
 
     let (status, hint) = bridge_status(v, opp);
-    let title_right = format!(
-        " {mine} vs {opp} · {} ─",
-        match &v.phase {
-            ViewPhase::Placing { .. } => "placing".to_string(),
-            ViewPhase::Battle { .. } => format!("shot {}", v.shot_number()),
-            ViewPhase::Reveal { .. } => "reveal".into(),
-            ViewPhase::Over { .. } => "over".into(),
-        }
-    );
+    let moment = match &v.phase {
+        ViewPhase::Placing { .. } => "placing".to_string(),
+        ViewPhase::Battle { .. } => format!("shot {}", v.shot_number()),
+        ViewPhase::Reveal { .. } => "reveal".into(),
+        ViewPhase::Over { .. } => "over".into(),
+    };
     let title_left = "╭─ 0sum · battleship ";
-    let bottom_left = format!("╰─ {status} ▶ {hint} ");
+    let room = WIDTH - title_left.chars().count() - format!("─  vs  · {moment} ─╮").chars().count();
+    let (mine, opp_short) = clip_pair(mine, opp, room);
+    let title_right = format!(" {mine} vs {opp_short} · {moment} ─");
+    let hint_fits = format!("╰─ {status} ▶ {hint} ─╯").chars().count() <= WIDTH;
+    if !hint_fits {
+        full(&mut lines, &format!("▶ {hint}"));
+    }
+    if let Some(e) = &v.error {
+        let mut top = Vec::new();
+        full(&mut top, &format!("error: {e}"));
+        lines.splice(0..0, top);
+    }
 
-    let mut left_w = 37;
-    let mut right_w = 38;
-    for l in &lines {
-        if let Line::Split(a, b) = l {
-            left_w = left_w.max(a.w + 2);
-            right_w = right_w.max(b.w + 1);
-        }
-    }
-    let mut inner = left_w + right_w;
-    for l in &lines {
-        if let Line::Full(a) = l {
-            inner = inner.max(a.w + 1);
-        }
-    }
-    let title_w = title_left.chars().count() + title_right.chars().count() + 1;
-    let bottom_w = bottom_left.chars().count() + 2;
-    let width = (inner + 3).max(title_w).max(bottom_w);
-    let inner = width - 3;
-    let right_w = inner - left_w;
+    let (width, inner, left_w, right_w) = (WIDTH, INNER, LEFT_W, RIGHT_W);
 
     let frame = |s: &str| {
         let mut t = Span::default();
@@ -954,9 +1039,6 @@ pub fn draw_bridge(v: &View, names: &[String], color: bool) -> String {
         t.s
     };
     let mut out = Vec::new();
-    if let Some(e) = &v.error {
-        out.push(format!("error: {e}"));
-    }
     let fill = width - title_left.chars().count() - title_right.chars().count() - 1;
     let mut top = Span::default();
     top.paint(FRAME, "╭─ ", color)
@@ -984,15 +1066,19 @@ pub fn draw_bridge(v: &View, names: &[String], color: bool) -> String {
     let mut bottom = Span::default();
     bottom
         .paint(FRAME, "╰─ ", color)
-        .paint(BOLD, &status, color)
-        .push(&format!(" ▶ {hint} "));
+        .paint(BOLD, &status, color);
+    if hint_fits {
+        bottom.push(&format!(" ▶ {hint} "));
+    } else {
+        bottom.push(" ");
+    }
     let fill = width - bottom.w - 1;
     bottom.paint(FRAME, &format!("{}╯", "─".repeat(fill)), color);
     out.push(bottom.s);
     out.join("\n")
 }
 
-fn legend(color: bool, battle: bool, afloat: Option<&str>) -> Span {
+fn legend(color: bool, battle: bool) -> Span {
     let mut t = Span::default();
     t.paint(FRAME, "·", color).push(" water  ");
     t.paint(SHIP, "■", color).push(" ship");
@@ -1001,10 +1087,57 @@ fn legend(color: bool, battle: bool, afloat: Option<&str>) -> Span {
         t.paint(SUNK, "▓", color).push(" sunk  ");
         t.paint(MISS, "○", color).push(" miss");
     }
-    if let Some(a) = afloat {
-        t.pad(46).push(a);
-    }
     t
+}
+
+/// Plain text as frame-wide lines, wrapped at spaces.
+fn full(lines: &mut Vec<Line>, s: &str) {
+    lines.extend(wrap(s, INNER - 1).iter().map(|l| Line::Full(text(l))));
+}
+
+/// `s` broken at spaces into lines of at most `w` columns; later lines are
+/// indented two.
+fn wrap(s: &str, w: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut line = String::new();
+    let mut fresh = true;
+    for word in s.split(' ') {
+        if !fresh && line.chars().count() + 1 + word.chars().count() > w {
+            out.push(std::mem::replace(&mut line, "  ".into()));
+            fresh = true;
+        }
+        if !fresh {
+            line.push(' ');
+        }
+        line.push_str(word);
+        fresh = false;
+    }
+    out.push(line);
+    out
+}
+
+/// Both names in `room` columns, the longer one cut first, with `…`.
+fn clip_pair<'a>(a: &'a str, b: &'a str, room: usize) -> (String, String) {
+    let (na, nb) = (a.chars().count(), b.chars().count());
+    if na + nb <= room {
+        return (a.into(), b.into());
+    }
+    let half = room / 2;
+    let (wa, wb) = if na <= half {
+        (na, room - na)
+    } else if nb <= half {
+        (room - nb, nb)
+    } else {
+        (room - half, half)
+    };
+    let clip = |s: &str, n: usize, w: usize| {
+        if n <= w {
+            s.to_string()
+        } else {
+            format!("{}…", s.chars().take(w - 1).collect::<String>())
+        }
+    };
+    (clip(a, na, wa), clip(b, nb, wb))
 }
 
 fn bridge_status(v: &View, opp: &str) -> (String, String) {

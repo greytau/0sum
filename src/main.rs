@@ -129,15 +129,37 @@ fn main() {
             name,
             format,
         } => cmd_register(&store, &session_id, &name, &shell.prefs(format.as_deref())),
-        Command::Play { format, moves } => {
-            cmd_play(&store, &moves, &shell.prefs(format.as_deref()))
-        }
+        Command::Play { format, moves } => split_format(format, moves)
+            .and_then(|(format, moves)| cmd_play(&store, &moves, &shell.prefs(format.as_deref()))),
         Command::Verify { session_id } => cmd_verify(&store, &session_id),
     });
     if let Err(e) = result {
         eprintln!("error: {e}");
         std::process::exit(1);
     }
+}
+
+/// `--format <id>` may sit among the moves too; once, wherever it is.
+fn split_format(
+    mut format: Option<String>,
+    moves: Vec<String>,
+) -> Result<(Option<String>, Vec<String>), String> {
+    let mut rest = Vec::with_capacity(moves.len());
+    let mut it = moves.into_iter();
+    while let Some(t) = it.next() {
+        let id = if t == "--format" {
+            it.next().ok_or("--format takes a format id")?
+        } else if let Some(id) = t.strip_prefix("--format=") {
+            id.to_string()
+        } else {
+            rest.push(t);
+            continue;
+        };
+        if format.replace(id).is_some() {
+            return Err("--format given twice".into());
+        }
+    }
+    Ok((format, rest))
 }
 
 trait Driver {
@@ -241,11 +263,13 @@ fn ctx_for(pw: &Password) -> Ctx {
 }
 
 /// Prints the narration and returns it, for [`print_status`].
-fn print_steps<G: Game>(chain: &Chain<G>, names: &[String]) -> Vec<String> {
+fn print_steps<G: Game>(chain: &Chain<G>, names: &[String], quiet: bool) -> Vec<String> {
     let mut said = Vec::new();
     for step in &chain.steps {
         for line in G::narrate(&step.before, step.author, &step.event, &step.after, names) {
-            println!("{line}");
+            if !quiet {
+                println!("{line}");
+            }
             said.push(line);
         }
     }
@@ -419,7 +443,7 @@ impl<G: Game> Driver for Engine<G> {
         println!("  {}", load_hint(prefs.flag.map(|_| format.id)));
         println!("Then play with `zs play …` (plain `zs play` shows the table).");
         println!();
-        let said = print_steps(&chain, &t.names);
+        let said = print_steps(&chain, &t.names, format.id == "ledger");
         if t.started() {
             println!("All players in.");
             print_status(&t, seat, &ctx, &said, format);
@@ -457,7 +481,9 @@ impl<G: Game> Driver for Engine<G> {
             ));
         }
         if let Some(line) = G::game_over(&t.state, &t.names) {
-            println!("{line}");
+            if format.id != "ledger" {
+                println!("{line}");
+            }
             print_status(&t, me, &ctx, &[], format);
             print_whereabouts(&s, &t, me);
             return Ok(());
@@ -480,7 +506,7 @@ impl<G: Game> Driver for Engine<G> {
             store.save(&s)?;
         }
         let marked = write_mark(store, &s, &t, me, &sk);
-        let said = print_steps(&chain, &t.names);
+        let said = print_steps(&chain, &t.names, format.id == "ledger");
         if appended || tokens.is_empty() {
             print_status(&t, me, &ctx, &said, format);
         }
