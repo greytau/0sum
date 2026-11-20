@@ -2,6 +2,7 @@
 //! log (docs/PHASE2.md); state is a replay of it through the game's `fold`.
 //! This file is the CLI plus the registry: one `match` from game id to engine.
 
+mod battleship;
 mod engine;
 mod farkle;
 mod liars_dice;
@@ -14,6 +15,7 @@ use clap::{Parser, Subcommand};
 use rand::rngs::{OsRng, StdRng};
 use rand::{RngCore, SeedableRng};
 
+use battleship::Battleship;
 use engine::keys::{self, Password, Secrets};
 use engine::log::Session;
 use engine::{
@@ -40,9 +42,9 @@ struct Cli {
 enum Command {
     /// Create a new game session (prompts for players), print a session id.
     New {
-        /// Which game: farkle, liars-dice (aliases liarsdice, ld).
+        /// Which game: battleship (aliases bs, battleships), farkle, liars-dice (aliases liarsdice, ld).
         game: String,
-        /// Ruleset variant (farkle: kcd [default], classic; liars-dice: classic [default], natural).
+        /// Ruleset variant (battleship: classic [default], notouch; farkle: kcd [default], classic; liars-dice: classic [default], natural).
         #[arg(long)]
         ruleset: Option<String>,
     },
@@ -50,13 +52,16 @@ enum Command {
     Register {
         session_id: String,
         name: String,
-        /// Render format for this seat, baked into the printed `zs` hint.
+        /// Render format for this seat, baked into the printed `zs` hint
+        /// (battleship: bridge, logbook, ledger).
         #[arg(long)]
         format: Option<String>,
     },
     /// Play with the password in ZEROSUM_PASSWORD. No moves = show status.
     /// Farkle: `roll`, `keep <dice...>`, `bank`; moves chain: `keep 5 5 roll`.
     /// Liar's Dice: `bid <qty> <face>`, `liar`, `spot` (one per call).
+    /// Battleship: `place <ship> <square> <h|v> ...`, `place auto`, `ready`,
+    /// `fire <square>` or just `<square>`; moves chain: `place auto ready`.
     Play {
         /// Render format for this run (overrides ZEROSUM_FORMAT).
         #[arg(long)]
@@ -161,8 +166,9 @@ fn driver(game: &str) -> Result<&'static dyn Driver, String> {
     match game.to_ascii_lowercase().as_str() {
         "farkle" => Ok(&Engine::<Farkle>(PhantomData)),
         "liars-dice" | "liarsdice" | "ld" => Ok(&Engine::<LiarsDice>(PhantomData)),
+        "battleship" | "bs" | "battleships" => Ok(&Engine::<Battleship>(PhantomData)),
         other => Err(format!(
-            "unknown game `{}` (available: farkle, liars-dice)",
+            "unknown game `{}` (available: battleship, farkle, liars-dice)",
             escape(other)
         )),
     }

@@ -1,0 +1,20 @@
+--- battleship: Alice vs Bob, shot 31 ---
+
+  your fleet                 your shots
+    1 2 3 4 5 6 7 8 9 10       1 2 3 4 5 6 7 8 9 10
+  A . # # # # # . . o .      A o . . . . . . . . .
+  B . . o . . . . o . .      B . . X X . . . . . .
+  C . . . . o . . . # .      C . . o . . . o . . .
+  D . o . . . . . . X .      D . . . . . . = . o .
+  E . # # # . . . . X .      E . . . . o . = . . o
+  F . . . . . o . . # .      F . o . . . . = . . .
+  G . . o . . . . . . .      G . . . . . . o . . .
+  H o . . . # . . o . .      H . . . o . . . . . .
+  I . . . . # . . = = .      I . . . . . . . o . .
+  J o . . . # . . . . o      J . . . . . . . . . .
+
+  . water   # ship   X hit   = sunk   o miss
+  you fired F7: sunk, cruiser
+  Bob fired E9: hit
+  afloat: you 4/5, Bob 4/5
+  Alice's turn - fire: zs play fire <square>, e.g. zs play fire B5

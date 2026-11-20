@@ -4,7 +4,6 @@
 pub mod hw;
 pub mod keys;
 pub mod log;
-#[allow(dead_code)] // first user: battleship, next commit
 pub mod slots;
 
 use std::fmt::{self, Debug};

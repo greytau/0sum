@@ -538,6 +538,6 @@ fn an_unknown_game_is_escaped_once() {
     assert_eq!(o.status.code(), Some(1));
     assert_eq!(
         out(&o).trim(),
-        r"BROKEN at seq 0: unknown game `chess\u{1b}` (available: farkle, liars-dice)"
+        r"BROKEN at seq 0: unknown game `chess\u{1b}` (available: battleship, farkle, liars-dice)"
     );
 }
