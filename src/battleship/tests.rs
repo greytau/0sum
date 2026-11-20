@@ -1,6 +1,6 @@
 use super::*;
 use crate::engine::log::{Body, Entry, Session};
-use crate::engine::testkit::{player, seated, Player};
+use crate::engine::testkit::{player, seated, Player, PASSWORDS};
 use crate::engine::{
     append, apply_chain, new_session, replay, replay_narrated, resolve_format, Chain, FormatPrefs,
     Table,
@@ -96,17 +96,16 @@ fn put(g: &mut Seated, seat: usize, ev: Event) -> Result<(), String> {
 
 /// A validly signed entry pushed without folding it.
 fn forge(s: &mut Session, seat: usize, ev: &Event) {
+    forge_as(s, seat, ev, &player(seat).sk);
+}
+
+/// [`forge`], signed with whatever key the cheater holds.
+fn forge_as(s: &mut Session, seat: usize, ev: &Event, sk: &ed25519_dalek::SigningKey) {
     let prev = s.log.last().unwrap().hash;
     let seq = s.log.len() as u64;
     let body = Body::Game(serde_json::to_value(ev).unwrap());
-    s.log.push(Entry::signed(
-        seq,
-        0,
-        self::seat(seat),
-        prev,
-        body,
-        &player(seat).sk,
-    ));
+    s.log
+        .push(Entry::signed(seq, 0, self::seat(seat), prev, body, sk));
 }
 
 fn broken(s: &Session) -> String {
@@ -1670,4 +1669,364 @@ fn battleship_formats_resolve_per_seat() {
         "battleship has no `harbor` format (bridge, ledger, logbook)"
     );
     assert!(r(prefs(Some("ledge"), None, true, false)).is_err());
+}
+
+// ---------------------------------------------------------------- doctored sessions on disk
+
+/// A doctored session as the real driver meets it on disk: each seat's
+/// plain `zs play` in seat order, then `0sum verify`.
+struct Disk {
+    plays: Vec<Result<(), String>>,
+    verify: Result<(), String>,
+    after: Session,
+}
+
+fn on_disk(s: &Session, passwords: &[&str]) -> Disk {
+    use crate::engine::hw;
+    use crate::engine::keys::{Password, Secrets};
+    use crate::storage::Store;
+    use crate::Driver;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static N: AtomicU32 = AtomicU32::new(0);
+    let root = std::env::temp_dir().join(format!(
+        "0sum-bs-doctored-{}-{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    let store = Store::at(root.clone());
+    store.prepare().unwrap();
+    assert!(store.create(s).unwrap());
+    let sid = s.session_id.clone();
+    let pws: Vec<Password> = passwords
+        .iter()
+        .map(|p| Password::parse(p).unwrap())
+        .collect();
+    for (i, pw) in pws.iter().enumerate() {
+        let sk = Secrets::from_password(pw).signing_key();
+        store.write_hw(&sid, seat(i), &hw::mark(s, &sk)).unwrap();
+    }
+    let engine = crate::Engine::<Battleship>(std::marker::PhantomData);
+    let prefs = FormatPrefs {
+        flag: Some("ledger"),
+        env: None,
+        tty: false,
+        no_color: false,
+    };
+    let plays = pws
+        .iter()
+        .map(|pw| engine.play(&store, store.load(&sid).ok().unwrap(), pw, &[], &prefs))
+        .collect();
+    let after = store.load(&sid).ok().unwrap();
+    let verify = engine.verify(&after);
+    std::fs::remove_dir_all(&root).unwrap();
+    Disk {
+        plays,
+        verify,
+        after,
+    }
+}
+
+/// BROKEN on disk: verify fails, both seats' binaries refuse, nothing lands.
+fn refused_everywhere(s: &Session, reason: &str) {
+    let d = on_disk(s, &PASSWORDS[..2]);
+    let refusal =
+        format!("session TEST01 is {reason} — refusing to append (see `0sum verify TEST01`)");
+    assert_eq!(d.plays, vec![Err(refusal.clone()), Err(refusal)]);
+    assert_eq!(d.verify, Err(reason.to_string()));
+    assert_eq!(d.after.log.len(), s.log.len());
+}
+
+/// Each vector as a modified binary would leave it: re-signed with the
+/// cheater's own key, so only `fold` can catch it.
+#[test]
+fn doctored_sessions_on_disk_stop_both_seats() {
+    // Bob moves his carrier to J1 h after `fleet`, with an honest commitment.
+    let g = locked();
+    let mut s = g.0.clone();
+    let scope = board::ship_scope("TEST01", "p2");
+    let c = Hex(board::ship_commitment(&scope, &seed_of(1), 0, h(9, 0)));
+    forge(&mut s, 1, &Event::Placed { ship: 0, c });
+    refused_everywhere(
+        &s,
+        "BROKEN at seq 15: p2 moved a ship after locking the fleet",
+    );
+
+    // Bob calls water (B1) a hit, with B1's true salt.
+    let mut g = locked();
+    put(&mut g, 0, Event::Shot { cell: 10 }).unwrap();
+    assert!(put(&mut g, 1, answer_with(1, 10, true, None)).is_err());
+    let mut s = g.0.clone();
+    forge(&mut s, 1, &answer_with(1, 10, true, None));
+    refused_everywhere(
+        &s,
+        "BROKEN at seq 16: p2's answer for B1 doesn't open p2's commitment for that square",
+    );
+
+    // Slot swaps: A1 answered with A2's opening, or A2's opening as the answer.
+    let mut g = locked();
+    put(&mut g, 0, Event::Shot { cell: 0 }).unwrap();
+    for (cell, reason) in [
+        (
+            0,
+            "p2's answer for A1 doesn't open p2's commitment for that square",
+        ),
+        (1, "p2 answered A2 but the shot was at A1"),
+    ] {
+        let mut s = g.0.clone();
+        let salt = cell_salt(1, 1);
+        let ev = Event::Answer {
+            cell,
+            hit: true,
+            salt,
+            sunk: None,
+        };
+        forge(&mut s, 1, &ev);
+        refused_everywhere(&s, &format!("BROKEN at seq 16: {reason}"));
+    }
+
+    // Alice answers her own shot for Bob, even with Bob's true opening.
+    let mut s = g.0.clone();
+    forge(&mut s, 0, &answer_with(1, 0, true, None));
+    refused_everywhere(&s, "BROKEN at seq 16: only p2 can answer the shot at A1");
+
+    // The loser reveals.
+    let g = bob_wins_to_reveal();
+    let mut s = g.0.clone();
+    let ev = Event::Reveal {
+        b: Hex(seed_of(0)),
+        fleet: alice_fleet(),
+    };
+    forge(&mut s, 0, &ev);
+    let n = s.log.len() - 1;
+    refused_everywhere(
+        &s,
+        &format!("BROKEN at seq {n}: p1 owes no reveal: p1's fleet was sunk"),
+    );
+}
+
+/// A lie a well-formed entry proves is a forfeit on disk too: verify is OK
+/// and names the cheat, and neither seat's run appends anything after it.
+#[test]
+fn doctored_forfeits_on_disk_end_the_game_for_both_seats() {
+    // Bob holds back the destroyer's sunk on A2, then declares it on B1.
+    let mut g = locked();
+    let mut withhold = |st: &State, d: usize| {
+        (d == 1 && st.pending == Some(1)).then(|| answer_with(1, 1, true, None))
+    };
+    duel(&mut g, [&[0, 1], &[44, 45]], &mut withhold);
+    put(&mut g, 0, Event::Shot { cell: 10 }).unwrap();
+    let mut s = g.0.clone();
+    forge(&mut s, 1, &answer_with(1, 10, false, Some((4, h(0, 0)))));
+    let d = on_disk(&s, &PASSWORDS[..2]);
+    assert_eq!(d.plays, vec![Ok(()), Ok(())]);
+    assert_eq!(d.verify, Ok(()));
+    assert_eq!(d.after.log.len(), s.log.len());
+    assert!(narrative(&d.after).last().unwrap().ends_with("CHEAT: Bob declared the destroyer sunk on the shot at B1, which isn't on it: the sunk was held back. Bob forfeits; Alice wins."));
+
+    // Bob's rigged board wins; his own unmodified binary owes the reveal,
+    // and that reveal is the proof.
+    let mut g = rigged_bob();
+    let water = water_of(&BOB_SHIPS);
+    duel(&mut g, [&water, &ALICE_SHIPS], &mut honest);
+    assert_eq!(g.1.state.provisional, Some(1));
+    let d = on_disk(&g.0, &PASSWORDS[..2]);
+    assert_eq!(d.plays, vec![Ok(()), Ok(())]);
+    assert_eq!(d.verify, Ok(()));
+    assert_eq!(d.after.log.len(), g.0.log.len() + 1);
+    let text = narrative(&d.after).join("\n");
+    assert!(text.contains("CHEAT: Bob's carrier covers C3 but the board marks it as water. Bob forfeits; Alice wins."), "{text}");
+    let again = on_disk(&d.after, &PASSWORDS[..2]);
+    assert_eq!(again.after.log.len(), d.after.log.len());
+}
+
+/// Bob signs his TEST01 fleet into TEST02 with his TEST02 key: it folds, but
+/// nothing he holds opens it here. Copied verbatim, TEST01's signature fails.
+#[test]
+fn a_fleet_replayed_from_another_session_never_answers() {
+    use crate::engine::keys::{Password, Secrets};
+    use rand::{rngs::StdRng, SeedableRng};
+    const TEST02: [&str; 2] = [
+        "TEST02-AAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "TEST02-BBBBBBBBBBBBBBBBBBBBBBBBBB",
+    ];
+    let names = vec!["Alice".to_string(), "Bob".to_string()];
+    let mut s = new_session::<Battleship>("TEST02", &RuleSet::classic(), &names, [0; 16]).unwrap();
+    let mut t = replay::<Battleship>(&s).unwrap();
+    let players: Vec<Player> = TEST02
+        .iter()
+        .enumerate()
+        .map(|(i, pw)| {
+            let secrets = Secrets::from_password(&Password::parse(pw).unwrap());
+            Player {
+                sk: secrets.signing_key(),
+                ctx: Ctx {
+                    secrets,
+                    rng: StdRng::seed_from_u64(i as u64),
+                },
+            }
+        })
+        .collect();
+    for (i, p) in players.iter().enumerate() {
+        crate::engine::append_register(&mut s, &mut t, i, &p.sk).unwrap();
+    }
+    let mut g: Seated = (s, t, players);
+    ok(&mut g, 0, &format!("{ALICE} ready"));
+    let (ships, cells) = committed(&locked(), 1);
+    for (k, c) in ships.into_iter().enumerate() {
+        let ev = Event::Placed {
+            ship: k as u8,
+            c: Hex(c),
+        };
+        put(&mut g, 1, ev).unwrap();
+    }
+    let cells = cells.into_iter().map(Hex).collect();
+    put(&mut g, 1, Event::Fleet { cells }).unwrap();
+    ok(&mut g, 0, "A1");
+    assert_eq!(duty_of(&g, 1), None);
+
+    let d = on_disk(&g.0, &TEST02);
+    assert_eq!(d.plays, vec![Ok(()), Ok(())]);
+    assert_eq!(d.after.log.len(), g.0.log.len(), "Bob can't answer");
+    assert_eq!(d.verify, Ok(()));
+
+    // His TEST01 opening of A1, re-signed for TEST02.
+    let mut s = g.0.clone();
+    forge_as(&mut s, 1, &answer_with(1, 0, true, None), &g.2[1].sk);
+    let n = s.log.len() - 1;
+    assert_eq!(
+        broken(&s),
+        format!(
+            "BROKEN at seq {n}: p2's answer for A1 doesn't open p2's commitment for that square"
+        )
+    );
+    // The same answer under his TEST01 key.
+    let mut s = g.0.clone();
+    forge(&mut s, 1, &answer_with(1, 0, true, None));
+    assert_eq!(
+        broken(&s),
+        format!("BROKEN at seq {n}: signature doesn't verify under the author's key")
+    );
+}
+
+// ---------------------------------------------------------------- ledger-only play
+
+fn ledger_of(g: &Seated, seat: usize) -> String {
+    let ledger = Format {
+        id: "ledger",
+        color: false,
+    };
+    Battleship::render_as(
+        &g.1.state,
+        &g.1.names,
+        Some(seat),
+        Some(&g.2[seat].ctx),
+        ledger,
+    )
+}
+
+fn rc(sq: &str) -> (i8, i8) {
+    let row = sq.as_bytes()[0] - b'A';
+    (row as i8, sq[1..].parse::<i8>().unwrap() - 1)
+}
+
+/// `C3-G3` → C3 D3 E3 F3 G3.
+fn span(s: &str) -> Vec<(i8, i8)> {
+    let (a, b) = s.split_once('-').unwrap();
+    let ((r0, c0), (r1, c1)) = (rc(a), rc(b));
+    (r0..=r1)
+        .flat_map(|r| (c0..=c1).map(move |c| (r, c)))
+        .collect()
+}
+
+/// A player who reads nothing but its own ledger: extend a line of open
+/// hits, else probe an open hit's neighbours, else hunt the checkerboard.
+fn aim_from_ledger(ledger: &str) -> String {
+    let line = ledger
+        .lines()
+        .find_map(|l| l.strip_prefix("your shots: "))
+        .expect("a `your shots:` line");
+    let list = |s: &str| -> Vec<(i8, i8)> {
+        match s {
+            "none" => Vec::new(),
+            s => s.split(' ').map(rc).collect(),
+        }
+    };
+    let (mut open, mut shot) = (Vec::new(), Vec::new());
+    for part in line.split(" · ") {
+        if let Some(sq) = part.strip_prefix("open hits ") {
+            open = list(sq);
+        } else if let Some(sq) = part.strip_prefix("misses ") {
+            shot.extend(list(sq));
+        } else if let Some(ship) = part.strip_prefix("sunk ") {
+            if ship != "none" {
+                shot.extend(span(ship.split(' ').nth(1).unwrap()));
+            }
+        } else {
+            panic!("unexpected `{part}` in `{line}`");
+        }
+    }
+    shot.extend(&open);
+    let free =
+        |(r, c): (i8, i8)| (0..10).contains(&r) && (0..10).contains(&c) && !shot.contains(&(r, c));
+    let mut probe = None;
+    for &(r, c) in &open {
+        for (dr, dc) in [(0, 1), (1, 0), (0, -1), (-1, 0)] {
+            let next = (r + dr, c + dc);
+            let lined = open.contains(&(r - dr, c - dc));
+            if free(next) && probe.is_none_or(|(l, _): (bool, _)| lined && !l) {
+                probe = Some((lined, next));
+            }
+        }
+    }
+    let hunt = || {
+        let unshot = (0..100).map(|i| (i / 10, i % 10)).filter(|&sq| free(sq));
+        let mut unshot = unshot.collect::<Vec<_>>();
+        unshot.sort_by_key(|(r, c)| (r + c) % 2);
+        unshot[0]
+    };
+    let (r, c) = probe.map_or_else(hunt, |(_, sq)| sq);
+    format!("{}{}", (b'A' + r as u8) as char, c + 1)
+}
+
+/// The LLM playstyle: both seats aim from their ledger text alone, never a
+/// grid, and the game reaches a verified winner without a refused shot.
+#[test]
+fn the_ledger_alone_is_enough_to_play_to_a_win() {
+    let mut g = game(RuleSet::classic());
+    ok(&mut g, 0, "place auto ready");
+    ok(&mut g, 1, "place auto ready");
+    let mut fired = [0, 0];
+    while g.1.state.phase != Phase::Over {
+        let st = &g.1.state;
+        let (phase, pending, turn) = (st.phase, st.pending, st.turn);
+        match phase {
+            Phase::Battle if pending.is_some() => ok(&mut g, 1 - turn, ""),
+            Phase::Battle => {
+                let a = turn;
+                let text = ledger_of(&g, a);
+                assert!(!text.contains('\u{1b}'), "{text}");
+                let body = text.lines().skip(1).collect::<Vec<_>>().join("\n");
+                assert!(!body.contains("Alice") && !body.contains("Bob"), "{text}");
+                ok(&mut g, a, &aim_from_ledger(&text));
+                fired[a] += 1;
+                assert!(fired[a] <= 100, "{text}");
+            }
+            Phase::Reveal => {
+                let w = g.1.state.provisional.unwrap();
+                ok(&mut g, w, "")
+            }
+            Phase::Setup | Phase::Over => unreachable!(),
+        }
+    }
+    let o = outcome(&g);
+    assert_eq!(o.how, How::Sank);
+    let (w, l) = (o.winner, 1 - o.winner);
+    assert!(
+        ledger_of(&g, w).starts_with("over · you won: sank enemy's fleet; your fleet verified\n")
+    );
+    assert!(
+        ledger_of(&g, l).starts_with("over · enemy won: sank your fleet; enemy's fleet verified\n")
+    );
+    assert!(narrative(&g.0).last().unwrap().ends_with("fleet verified"));
 }

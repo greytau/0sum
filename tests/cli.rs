@@ -765,3 +765,261 @@ fn render_formats_flag_errors_env_falls_back() {
     };
     assert_eq!(looks(&[("ZEROSUM_FORMAT", "ledger")]), looks(&[]));
 }
+
+/// A battleship table with both seats registered: (SID, Alice's, Bob's password).
+fn battleship_table(sb: &Sandbox, new: &[&str]) -> (String, String, String) {
+    let mut args = vec!["new", "battleship"];
+    args.extend(new);
+    let o = sb.run(&args, "Alice\nBob\n", None);
+    assert!(o.status.success(), "{}", err(&o));
+    let sid = after(&out(&o), "SESSION ID:").to_string();
+    let mut pw = Vec::new();
+    for name in ["Alice", "Bob"] {
+        let o = sb.run(&["register", &sid, name], "", None);
+        assert!(o.status.success(), "{}", err(&o));
+        pw.push(after(&out(&o), "PASSWORD (keep secret):").to_string());
+    }
+    let bob = pw.pop().unwrap();
+    (sid, pw.pop().unwrap(), bob)
+}
+
+/// Every refusal through the real binary: exit 1, the reason on stderr, and
+/// not one byte appended to the log.
+#[test]
+fn battleship_illegal_moves_are_refused_and_append_nothing() {
+    let sb = Sandbox::new();
+    let log = |pw: &str| {
+        let sid = pw.split('-').next().unwrap();
+        fs::read_to_string(sb.root().join(format!("sessions/{sid}.json"))).unwrap()
+    };
+    let refused = |pw: &str, args: &[&str]| -> String {
+        let before = log(pw);
+        let mut a = vec!["play"];
+        a.extend(args);
+        let o = sb.run(&a, "", Some(pw));
+        assert_eq!(o.status.code(), Some(1), "{args:?}: {}", out(&o));
+        assert_eq!(log(pw), before, "{args:?} appended");
+        err(&o).trim().strip_prefix("error: ").unwrap().to_string()
+    };
+    let played = |pw: &str, args: &[&str]| {
+        let mut a = vec!["play"];
+        a.extend(args);
+        let o = sb.run(&a, "", Some(pw));
+        assert!(o.status.success(), "{args:?}: {}", err(&o));
+    };
+    let usage = "place takes <ship> <square> <h|v>, e.g. `place carrier A1 h`, or `place auto`";
+    let moves =
+        "(try: place <ship> <square> <h|v> | place auto | ready | fire <square> | <square>)";
+
+    let (_, alice, bob) = battleship_table(&sb, &[]);
+    assert_eq!(refused(&bob, &["B5"]), "the battle hasn't started");
+    assert_eq!(
+        refused(&alice, &["ready"]),
+        "place the carrier, battleship, cruiser, submarine and destroyer first (or place auto)"
+    );
+    for (args, why) in [
+        (
+            &["place", "carrier", "A8", "h"][..],
+            "the carrier doesn't fit at A8 across (5 long; the board ends at column 10)",
+        ),
+        (
+            &["place", "carrier", "J1", "v"],
+            "the carrier doesn't fit at J1 down (5 long; the board ends at row J)",
+        ),
+        (
+            &["place", "carrier", "K1", "h"],
+            "`K1` isn't on the board (rows A-J, columns 1-10)",
+        ),
+        (
+            &["place", "x", "A1", "h"],
+            "unknown ship `x` (carrier, battleship, cruiser, submarine, destroyer)",
+        ),
+        (
+            &["place", "c", "A1", "h"],
+            "`c` could be carrier or cruiser — type more letters",
+        ),
+        (&["place"], usage),
+        (&["place", "carrier", "A1"], usage),
+        (&["place", "carrier", "A1", "diagonal"], usage),
+    ] {
+        assert_eq!(refused(&alice, args), why, "{args:?}");
+    }
+    played(&alice, &["place", "carrier", "A1", "h"]);
+    assert_eq!(
+        refused(&alice, &["place", "battleship", "A3", "v"]),
+        "the battleship at A3 v overlaps your carrier at A3"
+    );
+    assert_eq!(
+        refused(&alice, &["ready"]),
+        "place the battleship, cruiser, submarine and destroyer first (or place auto)"
+    );
+    played(
+        &alice,
+        &["place", "carrier", "B1", "h", "place", "auto", "ready"],
+    );
+    for args in [&["place", "carrier", "A1", "h"][..], &["ready"], &["B5"]] {
+        assert_eq!(
+            refused(&alice, args),
+            "your fleet is locked; waiting on Bob to place theirs"
+        );
+    }
+    played(&bob, &["place", "auto", "ready"]);
+
+    assert_eq!(refused(&bob, &["B5"]), "it's Alice's turn, not yours");
+    assert_eq!(
+        refused(&alice, &["fire"]),
+        "fire takes a square, e.g. `fire B5`"
+    );
+    for sq in ["K1", "A11", "A0"] {
+        assert_eq!(
+            refused(&alice, &[sq]),
+            format!("`{sq}` isn't on the board (rows A-J, columns 1-10)")
+        );
+    }
+    assert_eq!(
+        refused(&alice, &["B5", "--format", "ledger"]),
+        format!("unknown move `--format` {moves}")
+    );
+    played(&alice, &["b5"]);
+    assert_eq!(
+        refused(&alice, &["B6"]),
+        "waiting on Bob's answer to the shot at B5"
+    );
+    played(&bob, &[]);
+    for args in [&["place", "auto"][..], &["ready"]] {
+        refused(&bob, args);
+    }
+    played(&bob, &["A1"]);
+    played(&alice, &[]);
+    for sq in ["B5", "b5", "fire B5"] {
+        let args: Vec<&str> = sq.split(' ').collect();
+        assert_eq!(refused(&alice, &args), "you already fired at B5");
+    }
+
+    let (_, alice, _) = battleship_table(&sb, &["--ruleset", "notouch"]);
+    played(&alice, &["place", "carrier", "A1", "h"]);
+    assert_eq!(
+        refused(&alice, &["place", "cruiser", "B6", "h"]),
+        "the cruiser at B6 h touches your carrier (ruleset notouch keeps ships apart)"
+    );
+}
+
+/// Mid-battle, every file under the seat's XDG/HOME holds no password and no
+/// placement but the one sunk ship's, and every ledger is free of escapes.
+#[test]
+fn battleship_disk_holds_no_unopened_placement() {
+    let sb = Sandbox::new();
+    let (sid, alice, bob) = battleship_table(&sb, &[]);
+    let play = |pw: &str, args: &[&str]| -> String {
+        let mut a = vec!["play"];
+        a.extend(args);
+        let o = sb.run_with(&a, "", Some(pw), &[("ZEROSUM_FORMAT", "ledger")]);
+        assert!(o.status.success(), "{args:?}: {}", err(&o));
+        assert!(!out(&o).contains('\u{1b}'), "{}", out(&o));
+        out(&o)
+    };
+    play(&alice, &["place", "auto", "ready"]);
+    let text = play(&bob, &["place", "auto", "ready"]);
+    let fleet = text
+        .lines()
+        .find(|l| l.starts_with("your fleet: "))
+        .unwrap();
+    let destroyer = fleet.split(" · ").last().unwrap();
+    let squares = ledger_squares(destroyer);
+    play(&alice, &[&squares[0]]);
+    play(&bob, &["J10"]);
+    play(&alice, &[&squares[1]]);
+    let text = play(&bob, &["J9"]);
+    assert!(text.contains("Alice sank Bob's destroyer"), "{text}");
+    play(&alice, &[]);
+
+    let mut files = Vec::new();
+    let mut dirs = vec![sb.0.clone()];
+    while let Some(d) = dirs.pop() {
+        for e in fs::read_dir(d).unwrap() {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                dirs.push(p);
+            } else {
+                files.push(p);
+            }
+        }
+    }
+    let mut names: Vec<String> = files
+        .iter()
+        .map(|p| p.strip_prefix(&sb.0).unwrap().display().to_string())
+        .collect();
+    names.sort();
+    let s = format!("0sum/sessions/{sid}");
+    assert_eq!(
+        names,
+        [".json", ".lock", ".p1.hw", ".p2.hw"].map(|x| format!("{s}{x}"))
+    );
+    let mut placements = Vec::new();
+    for p in &files {
+        let raw = fs::read_to_string(p).unwrap();
+        for pw in [&alice, &bob] {
+            assert!(!raw.contains(pw.split('-').nth(1).unwrap()), "{p:?}");
+        }
+        if raw.is_empty() {
+            continue;
+        }
+        let mut todo = vec![serde_json::from_str::<serde_json::Value>(&raw).unwrap()];
+        while let Some(v) = todo.pop() {
+            match v {
+                serde_json::Value::Object(m) => {
+                    assert!(!m.contains_key("reveal") && !m.contains_key("b"), "{p:?}");
+                    if m.contains_key("row") {
+                        placements.push(serde_json::Value::Object(m.clone()));
+                    }
+                    todo.extend(m.into_iter().map(|(_, v)| v));
+                }
+                serde_json::Value::Array(a) => todo.extend(a),
+                _ => {}
+            }
+        }
+    }
+    let (row, col) = (squares[0].as_bytes()[0] - b'A', &squares[0][1..]);
+    let dir = if squares[0][..1] == squares[1][..1] {
+        "h"
+    } else {
+        "v"
+    };
+    let col: u8 = col.parse().unwrap();
+    assert_eq!(
+        placements,
+        [serde_json::json!({ "row": row, "col": col - 1, "dir": dir })]
+    );
+    let o = sb.run(&["verify", &sid], "", None);
+    assert!(o.status.success(), "{}", out(&o));
+}
+
+/// R3 at the edges: an env value is never echoed, an empty NO_COLOR is unset,
+/// the flag beats the env, and a ledger from the flag has no escapes either.
+#[test]
+fn battleship_format_edges() {
+    let sb = Sandbox::new();
+    let (_, alice, _) = battleship_table(&sb, &[]);
+    let look = |args: &[&str], env: &[(&str, &str)]| {
+        let mut a = vec!["play"];
+        a.extend(args);
+        let o = sb.run_with(&a, "", Some(&alice), env);
+        assert!(o.status.success(), "{}", err(&o));
+        assert_eq!(err(&o), "");
+        out(&o)
+    };
+    let text = look(&[], &[("ZEROSUM_FORMAT", "\u{1b}[2J")]);
+    assert!(!text.contains('\u{1b}') && text.contains("--- battleship: Alice vs Bob, placing ---"));
+    let text = look(&[], &[("ZEROSUM_FORMAT", "bridge"), ("NO_COLOR", "")]);
+    assert!(
+        text.contains("\u{1b}[1m0sum · battleship\u{1b}[0m"),
+        "{text}"
+    );
+    let text = look(&["--format", "logbook"], &[("ZEROSUM_FORMAT", "bridge")]);
+    assert!(
+        text.contains("--- battleship: Alice vs Bob, placing ---"),
+        "{text}"
+    );
+    let text = look(&["--format", "ledger"], &[]);
+    assert!(text.starts_with("\nplacing · you vs Bob · ") && !text.contains('\u{1b}'));
+}
