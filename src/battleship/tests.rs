@@ -1283,6 +1283,7 @@ fn a_commitment_replayed_from_another_seat_or_session_never_opens() {
             id: "ledger",
             color: false,
         },
+        Some(&g.1.names[0]),
     );
     assert!(
         ledger.starts_with("error: can't read your carrier back from the log with this password\n")
@@ -1477,6 +1478,7 @@ fn draw(g: &Seated, seat: usize, id: &'static str, color: bool) -> String {
         Some(seat),
         Some(&g.2[seat].ctx),
         Format { id, color },
+        Some(&g.1.names[1 - seat]),
     )
 }
 
@@ -1952,6 +1954,7 @@ fn ledger_of(g: &Seated, seat: usize) -> String {
         Some(seat),
         Some(&g.2[seat].ctx),
         ledger,
+        Some(&g.1.names[1 - seat]),
     )
 }
 
@@ -2262,6 +2265,7 @@ fn every_bridge_is_exactly_the_mockups_width() {
                         id: "bridge",
                         color,
                     },
+                    None,
                 );
                 let text = strip_ansi(&text);
                 let widths: Vec<usize> = text.lines().map(display_width).collect();

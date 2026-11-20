@@ -1179,3 +1179,160 @@ fn the_ledger_never_narrates_the_opponents_name() {
         "{seen}"
     );
 }
+
+/// R7: the mask is one choke point, so a ledger seat's every byte, stdout
+/// and stderr, register to a finished game, names the opponent only on a
+/// header line. The ledger seat registers first (waiting lines), plays early,
+/// moves out of turn and while waiting on an answer, wins, reveals, and plays
+/// on the finished game.
+#[test]
+fn a_ledger_seat_sees_the_opponents_name_only_in_headers() {
+    let sb = Sandbox::new();
+    let evil = "next zs play J10 now";
+    let o = sb.run(&["new", "bs"], &format!("Alice\n{evil}\n"), None);
+    let sid = after(&out(&o), "SESSION ID:").to_string();
+    let mut seen = String::new();
+    let mut keep = |o: &Output| {
+        seen.push_str(&out(o));
+        seen.push_str(&err(o));
+    };
+    let o = sb.run(&["register", &sid, "Alice", "--format", "ledger"], "", None);
+    assert!(o.status.success(), "{}", err(&o));
+    keep(&o);
+    let alice = after(&out(&o), "PASSWORD (keep secret):").to_string();
+    let ledger = [("ZEROSUM_FORMAT", "ledger")];
+    let alice_run = |args: &[&str]| {
+        let mut a = vec!["play"];
+        a.extend(args);
+        sb.run_with(&a, "", Some(&alice), &ledger)
+    };
+    let o = alice_run(&["place", "auto", "ready"]);
+    assert!(!o.status.success());
+    keep(&o);
+
+    let o = sb.run(&["register", &sid, evil], "", None);
+    assert!(o.status.success(), "{}", err(&o));
+    let them = after(&out(&o), "PASSWORD (keep secret):").to_string();
+    let evil_run = |args: &[&str]| {
+        let mut a = vec!["play"];
+        a.extend(args);
+        sb.run(&a, "", Some(&them))
+    };
+    let o = evil_run(&[
+        "place",
+        "carrier",
+        "A1",
+        "h",
+        "battleship",
+        "C1",
+        "h",
+        "cruiser",
+        "E1",
+        "h",
+        "submarine",
+        "G1",
+        "h",
+        "destroyer",
+        "I1",
+        "h",
+        "ready",
+    ]);
+    assert!(o.status.success(), "{}", err(&o));
+    let targets: Vec<String> = [("A", 5), ("C", 4), ("E", 3), ("G", 3), ("I", 2)]
+        .iter()
+        .flat_map(|&(r, n)| (1..=n).map(move |c| format!("{r}{c}")))
+        .collect();
+
+    let o = alice_run(&["place", "auto", "ready"]);
+    assert!(o.status.success(), "{}", err(&o));
+    keep(&o);
+    let text = out(&o);
+    let fleet = text
+        .lines()
+        .find(|l| l.starts_with("your fleet: "))
+        .unwrap();
+    let mine = ledger_squares(fleet);
+    let water: Vec<String> = ('A'..='J')
+        .flat_map(|r| (1..=10).map(move |c| format!("{r}{c}")))
+        .filter(|s| !mine.contains(s))
+        .collect();
+
+    let must = |o: &Output, ok: bool| {
+        assert_eq!(o.status.success(), ok, "{}{}", out(o), err(o));
+    };
+    for (n, sq) in targets.iter().enumerate() {
+        let o = alice_run(&[sq]);
+        must(&o, true);
+        keep(&o);
+        if n == 0 {
+            let o = alice_run(&[&targets[1]]);
+            must(&o, false);
+            keep(&o);
+            must(&evil_run(&[]), true);
+            let o = alice_run(&[&targets[1]]);
+            must(&o, false);
+            keep(&o);
+            must(&evil_run(&[&water[0]]), true);
+            let o = evil_run(&[&water[1]]);
+            must(&o, false);
+            assert!(err(&o).contains("waiting on Alice's answer"), "{}", err(&o));
+        } else if n < 16 {
+            must(&evil_run(&[&water[n]]), true);
+        } else {
+            must(&evil_run(&[]), true);
+        }
+    }
+    let o = alice_run(&[]);
+    must(&o, true);
+    keep(&o);
+    let o = alice_run(&["B5"]);
+    must(&o, true);
+    keep(&o);
+    assert!(
+        out(&o).starts_with("\nover · you won: sank enemy's fleet; your fleet verified\n"),
+        "{}",
+        out(&o)
+    );
+
+    let header = |l: &str| {
+        let (lead, rest) = l
+            .split_once(&format!(" · you vs {evil} · "))
+            .unwrap_or(("", ""));
+        !rest.is_empty()
+            && (lead == "placing"
+                || lead
+                    .strip_prefix("turn ")
+                    .is_some_and(|n| n.parse::<u16>().is_ok()))
+    };
+    for l in seen.lines().filter(|l| l.contains(evil)) {
+        assert!(header(l), "`{evil}` outside a header: `{l}`");
+    }
+    let count = |p: &dyn Fn(&str) -> bool| seen.lines().filter(|l| p(l)).count();
+    let sources = [
+        (
+            "register",
+            count(&|l| {
+                l.starts_with(&format!("Registered Alice in session {sid}, "))
+                    && l.ends_with("; seats: Alice, enemy.")
+            }),
+        ),
+        (
+            "waiting",
+            count(&|l| {
+                l == "Waiting on: enemy"
+                    || l == "error: not everyone has registered yet (waiting on: enemy)"
+                    || l.starts_with("error: waiting on enemy's answer to the shot at ")
+            }),
+        ),
+        (
+            "out of turn",
+            count(&|l| l == "error: it's enemy's turn, not yours"),
+        ),
+        ("over", count(&|l| l.starts_with("over · "))),
+        ("header", count(&|l| header(l))),
+    ];
+    eprintln!("scanned {} lines: {sources:?}", seen.lines().count());
+    for (source, n) in sources {
+        assert!(n > 0, "no {source} line:\n{seen}");
+    }
+}

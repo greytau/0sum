@@ -101,12 +101,15 @@ pub trait Game: 'static {
     ) -> String;
 
     /// `render` in a resolved format. Display only: never touches the log.
+    /// `header` is the other seats' real names when `names` is masked (R7),
+    /// for a format whose header is the one place they may print.
     fn render_as(
         state: &Self::State,
         names: &[String],
         me: Option<usize>,
         ctx: Option<&Ctx>,
         _format: Format,
+        _header: Option<&str>,
     ) -> String {
         Self::render(state, names, me, ctx)
     }

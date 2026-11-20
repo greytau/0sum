@@ -276,10 +276,36 @@ fn print_steps<G: Game>(chain: &Chain<G>, names: &[String], quiet: bool) -> Vec<
     said
 }
 
+/// R7, the one choke point: on a ledger seat every other seat's name becomes
+/// `enemy` in the table itself, once, before anything prints, so nothing the
+/// run prints (narration, register and waiting lines, `may_move`'s errors,
+/// game over) can reach the real ones. Returns them for the ledger header,
+/// the one place they print.
+fn mask_names<G: Game>(t: &mut Table<G>, me: usize, format: Format) -> Option<String> {
+    if format.id != "ledger" {
+        return None;
+    }
+    let real: Vec<String> = t
+        .names
+        .iter_mut()
+        .enumerate()
+        .filter(|(seat, _)| *seat != me)
+        .map(|(_, n)| std::mem::replace(n, "enemy".into()))
+        .collect();
+    Some(real.join(", "))
+}
+
 /// The table. A render can open with a block the narration just printed (a
 /// resolved round's result is in both); that block isn't printed twice.
-fn print_status<G: Game>(t: &Table<G>, me: usize, ctx: &Ctx, said: &[String], format: Format) {
-    let view = G::render_as(&t.state, &t.names, Some(me), Some(ctx), format);
+fn print_status<G: Game>(
+    t: &Table<G>,
+    me: usize,
+    ctx: &Ctx,
+    said: &[String],
+    format: Format,
+    header: Option<&str>,
+) {
+    let view = G::render_as(&t.state, &t.names, Some(me), Some(ctx), format, header);
     let view = match view.split_once("\n\n") {
         Some((top, rest)) if top.lines().all(|l| said.iter().any(|s| s == l)) => rest,
         _ => &view,
@@ -406,6 +432,7 @@ impl<G: Game> Driver for Engine<G> {
         if t.keys[seat].is_some() {
             return Err(format!("`{}` has already registered", t.names[seat]));
         }
+        let header = mask_names(&mut t, seat, format);
         let pw = Password::generate(&t.session_id);
         let mut ctx = ctx_for(&pw);
         let sk = ctx.secrets.signing_key();
@@ -446,7 +473,7 @@ impl<G: Game> Driver for Engine<G> {
         let said = print_steps(&chain, &t.names, format.id == "ledger");
         if t.started() {
             println!("All players in.");
-            print_status(&t, seat, &ctx, &said, format);
+            print_status(&t, seat, &ctx, &said, format, header.as_deref());
         } else {
             println!("Waiting on: {}", t.unregistered().join(", "));
         }
@@ -471,6 +498,7 @@ impl<G: Game> Driver for Engine<G> {
         let Some(me) = t.seat_of(&sk.verifying_key()) else {
             return Err(not_seated(store, &s, &t, &sk));
         };
+        let header = mask_names(&mut t, me, format);
         check_mark(store, &s, &t, me, &sk)?;
         write_mark(store, &s, &t, me, &sk)?;
         if !t.started() {
@@ -484,7 +512,7 @@ impl<G: Game> Driver for Engine<G> {
             if format.id != "ledger" {
                 println!("{line}");
             }
-            print_status(&t, me, &ctx, &[], format);
+            print_status(&t, me, &ctx, &[], format, header.as_deref());
             print_whereabouts(&s, &t, me);
             return Ok(());
         }
@@ -508,7 +536,7 @@ impl<G: Game> Driver for Engine<G> {
         let marked = write_mark(store, &s, &t, me, &sk);
         let said = print_steps(&chain, &t.names, format.id == "ledger");
         if appended || tokens.is_empty() {
-            print_status(&t, me, &ctx, &said, format);
+            print_status(&t, me, &ctx, &said, format, header.as_deref());
         }
         print_whereabouts(&s, &t, me);
         marked?;

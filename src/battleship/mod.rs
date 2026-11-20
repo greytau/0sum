@@ -1024,7 +1024,7 @@ impl Game for Battleship {
             id: "logbook",
             color: false,
         };
-        Self::render_as(st, names, me, ctx, logbook)
+        Self::render_as(st, names, me, ctx, logbook, None)
     }
 
     fn render_as(
@@ -1033,11 +1033,12 @@ impl Game for Battleship {
         me: Option<usize>,
         ctx: Option<&Ctx>,
         format: Format,
+        header: Option<&str>,
     ) -> String {
         let v = view(st, me, ctx);
         match format.id {
             "bridge" => draw::draw_bridge(&v, names, format.color),
-            "ledger" => draw::draw_ledger(&v, names),
+            "ledger" => draw::draw_ledger(&v, header.unwrap_or("enemy")),
             _ => draw::draw_logbook(&v, names),
         }
     }

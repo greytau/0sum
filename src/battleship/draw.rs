@@ -383,10 +383,10 @@ fn result_words(v: &View, s: &ShotView) -> Option<String> {
 // ---------------------------------------------------------------- ledger
 
 /// R4: one fact per line, coordinates only, never an escape. The opponent's
-/// name appears only on the header line (H6); every other line says `enemy`.
-pub fn draw_ledger(v: &View, names: &[String]) -> String {
+/// name appears only on the header line (H6), and reaches here only as `opp`
+/// (R7); every other line says `enemy`.
+pub fn draw_ledger(v: &View, opp: &str) -> String {
     let me = v.me();
-    let opp = &names[1 - me];
     let mut out = Vec::new();
     if let Some(e) = &v.error {
         out.push(format!("error: {e}"));
